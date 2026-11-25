@@ -8,4 +8,3 @@ dist/
 build/
 *.db
 *.sqlite
-uv.lock

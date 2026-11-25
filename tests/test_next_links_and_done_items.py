@@ -1,5 +1,5 @@
-"""Regression tests for Cipher's approval round of 383112f: NEW-4 (next-link path hardening,
-probe t04) and NEW-5 (an unconfirmed `done` is called out on a no-ADT run, probe t01)."""
+"""Next-link path hardening, and `done` items that no ADT run has confirmed yet being called
+out on a run without an ADT."""
 
 import json
 
@@ -24,7 +24,7 @@ def seg(text, name, idx, value):
     return "\r".join(x for x in out if x)
 
 
-# ---- NEW-4 ---------------------------------------------------------------------------------------
+# ---- next-link path hardening --------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
@@ -50,7 +50,7 @@ def seg(text, name, idx, value):
         "/a%7Cb",  # '|' is not a plain URL path character
     ],
 )
-def test_new4_next_link_paths_rejected(path):
+def test_next_link_paths_rejected(path):
     assert same_server(f"{B}{path}", B) is False
 
 
@@ -70,11 +70,11 @@ def test_new4_next_link_paths_rejected(path):
         f"https://FHIR-OPEN.cerner.com:443{B.split('.com', 1)[1]}/Encounter?page=2",
     ],
 )
-def test_new4_legit_sandbox_next_links_still_pass(url):
+def test_legit_sandbox_next_links_still_pass(url):
     assert same_server(url, B) is True
 
 
-# ---- NEW-5 ---------------------------------------------------------------------------------------
+# ---- done items not yet confirmed by an ADT ------------------------------------------------------
 
 
 @pytest.fixture
@@ -117,7 +117,7 @@ def setup(offline, tmp_path, complete_a04, capsys):
 NOTE = "[1 item(s) marked done not yet confirmed by an ADT: EMPLOYER_MISSING]"
 
 
-def test_new5_done_not_confirmed_is_called_out(setup):
+def test_done_not_confirmed_is_called_out(setup):
     run, update, _, _ = setup
     update("EMPLOYER_MISSING", "done")
     rc, line, _ = run()
@@ -130,7 +130,7 @@ def test_new5_done_not_confirmed_is_called_out(setup):
     assert card["done_unconfirmed"] == ["EMPLOYER_MISSING"] and card["status"].endswith(NOTE)
 
 
-def test_new5_acknowledged_still_present_is_also_unconfirmed(setup):
+def test_acknowledged_still_present_is_also_unconfirmed(setup):
     run, update, noemp, _ = setup
     update("EMPLOYER_MISSING", "done")
     assert run("--adt", str(noemp))[0] == 2  # still there: flagged still_present
@@ -142,7 +142,7 @@ def test_new5_acknowledged_still_present_is_also_unconfirmed(setup):
     assert rc == 0 and line.endswith(NOTE)
 
 
-def test_new5_no_note_once_an_adt_run_confirms_it(setup):
+def test_no_note_once_an_adt_run_confirms_it(setup):
     run, update, _, full = setup
     update("EMPLOYER_MISSING", "done")
     assert run("--adt", str(full))[0] == 0  # employer now in the ADT: gap gone
@@ -151,7 +151,7 @@ def test_new5_no_note_once_an_adt_run_confirms_it(setup):
     assert line.startswith("WC READINESS CARD   READY")
 
 
-def test_new5_no_note_with_an_adt_or_for_other_states(setup):
+def test_no_note_with_an_adt_or_for_other_states(setup):
     run, update, noemp, _ = setup
     rc, line, _ = run()  # open item: blocking, no done note
     assert rc == 2 and "not yet confirmed" not in line
@@ -160,7 +160,7 @@ def test_new5_no_note_with_an_adt_or_for_other_states(setup):
     assert rc == 2 and "not yet confirmed" not in line
 
 
-# ---- found while re-running s02: two runs migrating the same file at once ---------------------
+# ---- two runs migrating the same file at once ----------------------------------------------------
 
 
 def test_concurrent_open_does_not_add_the_same_column_twice(tmp_path, monkeypatch):

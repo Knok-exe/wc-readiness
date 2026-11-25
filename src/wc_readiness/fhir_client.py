@@ -237,9 +237,9 @@ class FixtureSource:
     """Serves resources from a recorded/synthetic JSON file instead of the network.
 
     The file looks like {"resources": [ {...}, {...} ]}. Searches support the few parameters
-    this app uses: patient, -encounter and category. Like Oracle's open sandbox (OBSERVED: it
-    returned the whole problem list), an `encounter` parameter is accepted but not applied, so
-    callers must filter by encounter themselves.
+    this app uses: patient, -encounter and category. Like Oracle's open sandbox (which returned
+    the whole problem list), an `encounter` parameter is accepted but not applied, so callers
+    must filter by encounter themselves.
     """
 
     def __init__(self, data: dict):

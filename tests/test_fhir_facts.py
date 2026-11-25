@@ -43,7 +43,7 @@ def test_coverage_without_type_like_oracle_self_pay():
 
 
 def test_custom_attributes_in_oracle_shape():
-    """Same structure as the open sandbox's Encounter 97954296 (OBSERVED by Pip)."""
+    """Same structure as the open sandbox's Encounter 97954296 (as served by the sandbox)."""
     enc = {
         "extension": [
             {

@@ -1,8 +1,6 @@
-"""Regression tests for Cipher's final code review of 8cb7fe5 (CIPHER-CODE-REVIEW.md, section 5).
-
-Test names carry the review item (p0_1, p1_3, p2_7, ...). Probes p01-p17 are ported here
-where practical, so they run offline in CI.
-"""
+"""Safety checks: patient/encounter context, runs without an ADT, persisted site settings,
+which WC coverage counts, FHIR id and next-link validation, DB file handling, terminal-safe
+output and coordinator acknowledgments. All offline."""
 
 import copy
 import os
@@ -23,7 +21,7 @@ P1, E1, P2, E2 = "demo-wc-1001", "demo-enc-1001", "demo-wc-1002", "demo-enc-1002
 
 
 def seg(text: str, name: str, idx: int, value: str) -> str:
-    """Set field `idx` of every `name` segment (Cipher's common.seg)."""
+    """Set field `idx` of every `name` segment."""
     out = []
     for line in text.replace("\r", "\n").split("\n"):
         f = line.split("|")
@@ -83,15 +81,15 @@ def offline(monkeypatch, demo_data):
     return demo_data
 
 
-# ---- P0-1: Encounter / Coverage of another patient ------------------------------------------
+# ---- Encounter / Coverage of another patient -----------------------------------------------------
 
 
-def test_p0_1_encounter_of_other_patient_is_refused(demo_data):
+def test_encounter_of_other_patient_is_refused(demo_data):
     with pytest.raises(ContextMismatch, match="belongs to Patient/demo-wc-1001"):
         gather(FixtureSource(demo_data), P2, E1)
 
 
-def test_p0_1_cli_exits_1_and_writes_nothing(offline, tmp_path, capsys):
+def test_cli_exits_1_and_writes_nothing(offline, tmp_path, capsys):
     db = tmp_path / "wl.db"
     assert cli.main(["card", "--patient", P2, "--encounter", E1, "--db", str(db)]) == 1
     out = capsys.readouterr()
@@ -103,13 +101,13 @@ def test_p0_1_cli_exits_1_and_writes_nothing(offline, tmp_path, capsys):
     assert con.execute("SELECT COUNT(*) FROM settings").fetchone()[0] == 0
 
 
-def test_p0_1_absolute_subject_reference_is_accepted(demo_data):
+def test_absolute_subject_reference_is_accepted(demo_data):
     data = copy.deepcopy(demo_data)
     res(data, "Encounter", E1)["subject"] = {"reference": "https://x/r4/Patient/demo-wc-1001"}
     assert gather(FixtureSource(data), P1, E1).encounter_read
 
 
-def test_p0_1_coverage_of_other_patient_is_dropped(demo_data):
+def test_coverage_of_other_patient_is_dropped(demo_data):
     data = copy.deepcopy(demo_data)
     cov = res(data, "Coverage", "demo-cov-1001-wc")
     cov["beneficiary"] = {"reference": "Patient/someone-else"}
@@ -120,10 +118,10 @@ def test_p0_1_coverage_of_other_patient_is_dropped(demo_data):
     assert "COVERAGE_OTHER_PATIENT" in codes(card)
 
 
-# ---- P0-2: runs without an ADT can't undo decisions -----------------------------------------
+# ---- runs without an ADT can't undo decisions ----------------------------------------------------
 
 
-def test_p0_2_p11_no_adt_rerun_opens_nothing(demo_data, incomplete_a04):
+def test_no_adt_rerun_opens_nothing(demo_data, incomplete_a04):
     wl = Worklist()
     assert make(demo_data, P2, E2, incomplete_a04).wc_status == "wc"
     wl.sync(make(demo_data, P2, E2, incomplete_a04))
@@ -135,7 +133,7 @@ def test_p0_2_p11_no_adt_rerun_opens_nothing(demo_data, incomplete_a04):
     assert counts["opened"] == 0 and state(wl) == before
 
 
-def test_p0_2_p14a_dismissed_unclear_survives_no_adt_run(demo_data, incomplete_a04):
+def test_dismissed_unclear_survives_no_adt_run(demo_data, incomplete_a04):
     adt = seg(seg(incomplete_a04, "PV1", 20, "SP"), "IN1", 2, "PLAN01^Commercial")
     wl = Worklist()
     wl.sync(make(demo_data, P2, E2, adt))
@@ -147,7 +145,7 @@ def test_p0_2_p14a_dismissed_unclear_survives_no_adt_run(demo_data, incomplete_a
     assert wl.get(item.id).status == "dismissed"
 
 
-def test_p0_2_p14b_dismissed_conflict_survives_no_adt_then_adt(demo_data, complete_a04):
+def test_dismissed_conflict_survives_no_adt_then_adt(demo_data, complete_a04):
     data = copy.deepcopy(demo_data)
     res(data, "Condition", "demo-dx-1001")["onsetDateTime"] = "2026-11-10"
     wl = Worklist()
@@ -161,7 +159,7 @@ def test_p0_2_p14b_dismissed_conflict_survives_no_adt_then_adt(demo_data, comple
     assert [i.gap_code for i in wl.items(include_closed=True)] == ["INJURY_DATE_CONFLICT"]
 
 
-def test_p0_2_p17_ready_case_rerun_without_adt_changes_nothing(demo_data, complete_a04):
+def test_ready_case_rerun_without_adt_changes_nothing(demo_data, complete_a04):
     wl = Worklist()
     assert make(demo_data, P1, E1, complete_a04).status == "READY"
     wl.sync(make(demo_data, P1, E1, complete_a04))
@@ -172,7 +170,7 @@ def test_p0_2_p17_ready_case_rerun_without_adt_changes_nothing(demo_data, comple
     assert "provisional" in render_card(no_adt)
 
 
-def test_p0_2_case_without_any_adt_still_files_items(demo_data):
+def test_case_without_any_adt_still_files_items(demo_data):
     """A FHIR-only workflow (never an ADT) keeps today's behavior."""
     wl = Worklist()
     counts = wl.sync(make(demo_data, P2, E2))
@@ -180,11 +178,11 @@ def test_p0_2_case_without_any_adt_still_files_items(demo_data):
     assert [i.gap_code for i in wl.items()] == ["WC_STATUS_UNCLEAR"]
 
 
-# ---- P1-1: site settings persist ---------------------------------------------------------------
+# ---- site settings persist -----------------------------------------------------------------------
 
 
 def _site_w_adt(tmp_path, incomplete_a04):
-    """probe5 B2: site WC class 'W', IN1 not marked WC, no ACC segment."""
+    """site WC class 'W', IN1 not marked WC, no ACC segment."""
     text = without_seg(seg(incomplete_a04, "PV1", 20, "W"), "ACC")
     text = text.replace("WC001^Workers Comp", "P01^Health Plan")
     path = tmp_path / "w.hl7"
@@ -192,7 +190,7 @@ def _site_w_adt(tmp_path, incomplete_a04):
     return str(path)
 
 
-def test_p1_1_rerun_without_wc_class_uses_stored_value(offline, tmp_path, incomplete_a04, capsys):
+def test_rerun_without_wc_class_uses_stored_value(offline, tmp_path, incomplete_a04, capsys):
     db, adt = str(tmp_path / "wl.db"), _site_w_adt(tmp_path, incomplete_a04)
     base = ["card", "--patient", P2, "--encounter", E2, "--adt", adt, "--db", db]
     assert cli.main([*base, "--wc-class", "W"]) == 2
@@ -206,7 +204,7 @@ def test_p1_1_rerun_without_wc_class_uses_stored_value(offline, tmp_path, incomp
         assert not [r for r in wl.audit() if r["action"] == "resolved"]
 
 
-def test_p1_1_different_wc_class_needs_reconfigure(offline, tmp_path, incomplete_a04, capsys):
+def test_different_wc_class_needs_reconfigure(offline, tmp_path, incomplete_a04, capsys):
     db, adt = str(tmp_path / "wl.db"), _site_w_adt(tmp_path, incomplete_a04)
     base = ["card", "--patient", P2, "--encounter", E2, "--adt", adt, "--db", db]
     assert cli.main([*base, "--wc-class", "W"]) == 2
@@ -214,7 +212,7 @@ def test_p1_1_different_wc_class_needs_reconfigure(offline, tmp_path, incomplete
     assert "--reconfigure" in capsys.readouterr().err
 
 
-def test_p1_1_p08_site_tz_change_refused_then_audited(offline, tmp_path, capsys):
+def test_site_tz_change_refused_then_audited(offline, tmp_path, capsys):
     db = str(tmp_path / "wl.db")
     base = ["card", "--patient", P1, "--encounter", E1, "--db", db]
     assert cli.main(base) in (0, 2)  # stores America/New_York
@@ -229,11 +227,11 @@ def test_p1_1_p08_site_tz_change_refused_then_audited(offline, tmp_path, capsys)
         )
 
 
-# ---- P1-2: only active, in-date WC coverage counts -------------------------------------------
+# ---- only active, in-date WC coverage counts -----------------------------------------------------
 
 
 @pytest.mark.parametrize("status", ["cancelled", "entered-in-error", "draft"])
-def test_p1_2_p02_inactive_wc_coverage_doesnt_count(demo_data, complete_a04, status):
+def test_inactive_wc_coverage_doesnt_count(demo_data, complete_a04, status):
     data = copy.deepcopy(demo_data)
     res(data, "Coverage", "demo-cov-1001-wc")["status"] = status
     card = make(data, P1, E1, complete_a04)
@@ -242,7 +240,7 @@ def test_p1_2_p02_inactive_wc_coverage_doesnt_count(demo_data, complete_a04, sta
     assert not card.ready
 
 
-def test_p1_2_p03_old_claim_coverage_is_not_a_wc_signal(demo_data, complete_a04):
+def test_old_claim_coverage_is_not_a_wc_signal(demo_data, complete_a04):
     data = copy.deepcopy(demo_data)
     cov = res(data, "Coverage", "demo-cov-1001-wc")
     cov["period"] = {"start": "2019-01-01", "end": "2019-06-30"}
@@ -257,7 +255,7 @@ def test_p1_2_p03_old_claim_coverage_is_not_a_wc_signal(demo_data, complete_a04)
     assert "WC_COVERAGE_INACTIVE" in codes(card)
 
 
-def test_p1_2_encounter_level_coverage_is_preferred(demo_data):
+def test_encounter_level_coverage_is_preferred(demo_data):
     data = copy.deepcopy(demo_data)
     enc_cov = res(data, "Coverage", "demo-cov-1001-wc")
     pat_cov = copy.deepcopy(enc_cov)
@@ -274,12 +272,10 @@ def test_p1_2_encounter_level_coverage_is_preferred(demo_data):
     assert card.essentials["carrier"].source == "Coverage/demo-cov-1001-wc payor"
 
 
-# ---- P1-3: MRN with a different name AND birth date ------------------------------------------
+# ---- MRN with a different name AND birth date ----------------------------------------------------
 
 
-def test_p1_3_p04_mrn_match_with_other_person_is_a_mismatch(
-    demo_data, incomplete_a04, complete_a04
-):
+def test_mrn_match_with_other_person_is_a_mismatch(demo_data, incomplete_a04, complete_a04):
     wl = Worklist()
     wl.sync(make(demo_data, P2, E2, incomplete_a04))
     other = seg(complete_a04, "PID", 3, "700200^^^EXAMPLEHOSP^MR")
@@ -290,10 +286,10 @@ def test_p1_3_p04_mrn_match_with_other_person_is_a_mismatch(
     assert counts["resolved"] == 0 and counts["opened"] == 1
 
 
-# ---- P1-4: FHIR ids are validated and quoted ---------------------------------------------------
+# ---- FHIR ids are validated and quoted -----------------------------------------------------------
 
 
-def test_p1_4_p07_bad_patient_id_is_an_argparse_error(capsys):
+def test_bad_patient_id_is_an_argparse_error(capsys):
     with pytest.raises(SystemExit) as exc:
         cli.main(["card", "--patient", "1/../../Encounter/2", "--no-worklist"])
     assert exc.value.code == 2
@@ -301,20 +297,20 @@ def test_p1_4_p07_bad_patient_id_is_an_argparse_error(capsys):
 
 
 @pytest.mark.parametrize("bad", ["1?x", "1/../Encounter/2", "123#frag", "a b", "..", ""])
-def test_p1_4_client_refuses_bad_ids_before_any_request(bad):
+def test_client_refuses_bad_ids_before_any_request(bad):
     s = Sess({"resourceType": "Patient", "id": "1"})
     with pytest.raises(ValueError):
         FhirClient("https://x/r4", session=s).read("Patient", bad)
     assert s.urls == []
 
 
-def test_p1_4_read_checks_the_returned_resource_type():
+def test_read_checks_the_returned_resource_type():
     s = Sess({"resourceType": "Encounter", "id": "1"})
     with pytest.raises(FhirError, match="got a Encounter"):
         FhirClient("https://x/r4", session=s).read("Patient", "1")
 
 
-# ---- P1-5: next links must stay on the same server ---------------------------------------------
+# ---- next links must stay on the same server -----------------------------------------------------
 
 
 @pytest.mark.parametrize(
@@ -326,7 +322,7 @@ def test_p1_4_read_checks_the_returned_resource_type():
         ("https://fhir.example.com/r4", "https://fhir.example.com:8443/r4/Coverage?page=2"),
     ],
 )
-def test_p1_5_p05_lookalike_next_link_is_not_followed(base, next_url):
+def test_lookalike_next_link_is_not_followed(base, next_url):
     def body(url):
         if url == next_url:
             return {"resourceType": "Bundle", "entry": []}
@@ -338,7 +334,7 @@ def test_p1_5_p05_lookalike_next_link_is_not_followed(base, next_url):
     assert len(s.urls) == 1
 
 
-def test_p1_5_same_server_next_link_is_followed():
+def test_same_server_next_link_is_followed():
     def body(url):
         if "page=2" in url:
             return {
@@ -355,10 +351,10 @@ def test_p1_5_same_server_next_link_is_followed():
     assert [r["id"] for r in rows] == ["a", "b"]
 
 
-# ---- P2 ------------------------------------------------------------------------------------------
+# ---- smaller hardening ---------------------------------------------------------------------------
 
 
-def test_p2_1_p09_truncated_search_makes_rules_unchecked():
+def test_truncated_search_makes_rules_unchecked():
     def body(url):
         page = int(url.rsplit("page=", 1)[1]) if "page=" in url else 1
         if "/Patient/" in url:
@@ -380,7 +376,7 @@ def test_p2_1_p09_truncated_search_makes_rules_unchecked():
 
 
 @pytest.mark.parametrize("body", [[], "oops", ValueError("not json"), {"no": "resourceType"}])
-def test_p2_2_p06_non_fhir_bodies_are_read_errors(body):
+def test_non_fhir_bodies_are_read_errors(body):
     facts = gather(FhirClient("https://x", session=Sess(body)), "1", "2")
     assert {"Patient", "Encounter", "Coverage", "Condition"} <= set(facts.errors)
     assert not facts.encounter_read
@@ -401,13 +397,13 @@ def test_p2_2_p06_non_fhir_bodies_are_read_errors(body):
         ("I10", False),
     ],
 )
-def test_p2_3_injury_code_ranges(code, injury):
+def test_injury_code_ranges(code, injury):
     from wc_readiness.fhir_facts import _is_injury_code
 
     assert _is_injury_code({"system": "http://hl7.org/fhir/sid/icd-10-cm", "code": code}) is injury
 
 
-def test_p2_3_p13_allergy_is_not_in_the_conflict(demo_data, complete_a04):
+def test_allergy_is_not_in_the_conflict(demo_data, complete_a04):
     data = copy.deepcopy(demo_data)
     dx = copy.deepcopy(res(data, "Condition", "demo-dx-1001"))
     dx["id"] = "demo-dx-1001-w"
@@ -428,13 +424,13 @@ def test_p2_3_p13_allergy_is_not_in_the_conflict(demo_data, complete_a04):
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX file modes")
-def test_p2_4_p10_new_db_is_owner_only(tmp_path):
+def test_new_db_is_owner_only(tmp_path):
     db = tmp_path / "demo.db"
     assert cli.main(["--demo", "--db", str(db), "--format", "json"]) == 0
     assert os.stat(db).st_mode & 0o777 == 0o600
 
 
-def test_p2_5_p10_mistyped_db_is_an_error_not_a_new_list(tmp_path, capsys):
+def test_mistyped_db_is_an_error_not_a_new_list(tmp_path, capsys):
     db = tmp_path / "tpyo.db"
     for cmd in (["worklist"], ["audit"], ["update", "1", "--status", "done"]):
         assert cli.main([*cmd, "--db", str(db)]) == 1
@@ -442,7 +438,7 @@ def test_p2_5_p10_mistyped_db_is_an_error_not_a_new_list(tmp_path, capsys):
     assert not db.exists()
 
 
-def test_p2_5_p15_bad_db_files_exit_1_without_traceback(tmp_path, capsys):
+def test_bad_db_files_exit_1_without_traceback(tmp_path, capsys):
     bad = tmp_path / "notadb.db"
     bad.write_text("hello, not sqlite")
     folder = tmp_path / "adir"
@@ -453,14 +449,14 @@ def test_p2_5_p15_bad_db_files_exit_1_without_traceback(tmp_path, capsys):
             assert "cannot open worklist DB" in capsys.readouterr().err
 
 
-def test_p2_6_pid3_repetition_typed_mr_is_used(demo_data, incomplete_a04):
+def test_pid3_repetition_typed_mr_is_used(demo_data, incomplete_a04):
     adt = seg(incomplete_a04, "PID", 3, "C123^^^X^CMRN~700200^^^EXAMPLEHOSP^MR")
     assert parse_adt(adt).mrn == "700200"
     card = make(demo_data, P2, E2, adt)
     assert card.adt_matched and "matched on MRN 700200" in card.patient_match
 
 
-def test_p2_7_control_characters_are_not_printed(demo_data, incomplete_a04):
+def test_control_characters_are_not_printed(demo_data, incomplete_a04):
     adt = seg(incomplete_a04, "ACC", 8, "Fell\x1b]0;pwned\x07 off ladder\x9b")
     card = make(demo_data, P2, E2, adt)
     assert "\x1b]0;pwned\x07" in card.adt.accident_description  # data kept as-is
@@ -469,7 +465,7 @@ def test_p2_7_control_characters_are_not_printed(demo_data, incomplete_a04):
     assert "Fell?]0;pwned? off ladder?" in text
 
 
-def test_p2_7_worklist_and_audit_output_are_cleaned(tmp_path, capsys):
+def test_worklist_and_audit_output_are_cleaned(tmp_path, capsys):
     db = str(tmp_path / "wl.db")
     assert cli.main(["--demo", "--db", db, "--format", "json"]) == 0
     capsys.readouterr()
@@ -480,7 +476,7 @@ def test_p2_7_worklist_and_audit_output_are_cleaned(tmp_path, capsys):
         assert "\x1b" not in render_worklist(wl.items())
 
 
-def test_p2_8_p12_done_again_acknowledgment_sticks(demo_data, incomplete_a04):
+def test_done_again_acknowledgment_sticks(demo_data, incomplete_a04):
     wl = Worklist()
     card = make(demo_data, P2, E2, incomplete_a04)
     wl.sync(card)
@@ -508,7 +504,7 @@ def test_p2_8_p12_done_again_acknowledgment_sticks(demo_data, incomplete_a04):
     assert wl.get(claim.id).flag == "still_present"  # the old acknowledgment was cleared
 
 
-def test_p2_8_in_progress_again_acknowledges_not_wc_flag(demo_data, incomplete_a04):
+def test_in_progress_again_acknowledges_not_wc_flag(demo_data, incomplete_a04):
     wl = Worklist()
     wc = make(demo_data, P2, E2, incomplete_a04)
     wl.sync(wc)
@@ -531,7 +527,7 @@ def test_p2_8_in_progress_again_acknowledges_not_wc_flag(demo_data, incomplete_a
     assert wl.get(item.id).flag == "not_wc_visit"
 
 
-def test_p2_9_server_returning_another_encounter_id_keeps_the_case_key(demo_data):
+def test_server_returning_another_encounter_id_keeps_the_case_key(demo_data):
     class Renamed(FixtureSource):
         def read(self, rtype, rid):
             body = super().read(rtype, rid)
@@ -546,10 +542,10 @@ def test_p2_9_server_returning_another_encounter_id_keeps_the_case_key(demo_data
     assert "ENCOUNTER_ID_CHANGED" in codes(card)
 
 
-def test_p1_1_library_sync_refuses_a_card_built_with_other_wc_classes(
+def test_library_sync_refuses_a_card_built_with_other_wc_classes(
     demo_data, incomplete_a04, tmp_path
 ):
-    """probe5 B2 at the library level: the worklist itself checks the card's site rules."""
+    """At the library level: the worklist itself checks the card's site rules."""
     from wc_readiness.worklist import SettingsConflict
 
     adt = parse_adt(_site_w_adt_text(incomplete_a04))
@@ -569,12 +565,12 @@ def _site_w_adt_text(incomplete_a04):
     return text.replace("WC001^Workers Comp", "P01^Health Plan")
 
 
-def test_p0_2_old_db_cases_count_as_having_seen_an_adt(tmp_path, demo_data, incomplete_a04):
+def test_old_db_cases_count_as_having_seen_an_adt(tmp_path, demo_data, incomplete_a04):
     db = tmp_path / "old.db"
     with Worklist(db) as wl:
         wl.sync(make(demo_data, P2, E2, incomplete_a04))
     con = sqlite3.connect(db)
-    con.execute("ALTER TABLE cases DROP COLUMN adt_seen")  # an 8cb7fe5-era database
+    con.execute("ALTER TABLE cases DROP COLUMN adt_seen")  # a database from an older version
     con.commit()
     con.close()
     with Worklist(db) as wl:

@@ -64,3 +64,21 @@ def hl7_local_date(text: str, tz: tzinfo | None = None) -> str:
         delta = timedelta(hours=int(offset[1:3]), minutes=int(offset[3:5]))
         moment = moment.replace(tzinfo=timezone(sign * delta)).astimezone(tz)
     return moment.date().isoformat()
+
+
+_US_DATE = re.compile(r"^(\d{1,2})/(\d{1,2})/(\d{4})$")
+
+
+def loose_local_date(value: str, tz: tzinfo | None = None) -> str:
+    """Like fhir_local_date, but also takes a US MM/DD/YYYY string, which is how a free-text
+    registration field (an Encounter custom attribute) often holds a date. '' if unusable."""
+    found = fhir_local_date(value, tz)
+    if found:
+        return found
+    m = _US_DATE.match((value or "").strip())
+    if not m:
+        return ""
+    try:
+        return date(int(m[3]), int(m[1]), int(m[2])).isoformat()
+    except ValueError:
+        return ""

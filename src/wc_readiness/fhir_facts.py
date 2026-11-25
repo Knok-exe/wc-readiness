@@ -85,6 +85,8 @@ class ConditionFact:
 class FhirFacts:
     patient_id: str
     patient_name: str = ""
+    family_name: str = ""  # official name, structured (for matching against PID-5)
+    given_name: str = ""  # first given name only
     birth_date: str = ""
     mrns: list[str] = field(default_factory=list)
     encounter_id: str = ""
@@ -262,7 +264,7 @@ def condition_fact(
         category=categories,
         is_injury=any(_is_injury_code(c) for c in (res.get("code") or {}).get("coding", [])),
         linked_to_encounter=bool(encounter_id)
-        and (enc_ref == f"Encounter/{encounter_id}" or res.get("id") in diagnosis_ids),
+        and (_refers_to(enc_ref, "Encounter", encounter_id) or res.get("id") in diagnosis_ids),
     )
 
 
@@ -325,6 +327,8 @@ def gather(
         facts.patient_name = official.get("text") or ", ".join(
             p for p in (official.get("family", ""), " ".join(official.get("given", []))) if p
         )
+        facts.family_name = official.get("family", "")
+        facts.given_name = next(iter(official.get("given") or []), "")
         facts.birth_date = patient.get("birthDate", "")
         facts.mrns = [
             i.get("value", "")
@@ -376,12 +380,13 @@ def gather(
         ]
         facts.custom_attributes = custom_attributes(encounter)
         for dx in encounter.get("diagnosis", []):
-            ref = (dx.get("condition") or {}).get("reference", "")
-            if ref.startswith("Condition/"):
-                diagnosis_ids.add(ref.split("/", 1)[1])
+            parts = (dx.get("condition") or {}).get("reference", "").split("/_history/")[0]
+            parts = parts.rstrip("/").split("/")
+            if len(parts) >= 2 and parts[-2] == "Condition":
+                diagnosis_ids.add(parts[-1])
 
-    # Coverage: patient-level plus encounter-level. Oracle refuses patient and -encounter in
-    # the same request (OBSERVED: "_id, patient, and -encounter may not be set at the same time").
+    # Coverage: patient-level plus encounter-level. Oracle refuses patient and -encounter in the
+    # same request ("_id, patient, and -encounter may not be set at the same time").
     seen: set[str] = set()
     queries = [("Coverage", {"patient": patient_id})]
     if facts.encounter_id:

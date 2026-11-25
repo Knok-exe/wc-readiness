@@ -1,7 +1,7 @@
 """Pull the workers' comp fields out of an HL7 v2 ADT message (usually A04 "register a patient").
 
-FHIR at Oracle Health doesn't expose employer, injury date, claim number or financial class
-(see Pip's RESEARCH.md section 2b), but the registration system sends them in HL7 v2:
+Oracle Health's FHIR API doesn't expose employer, injury date, claim number or financial class,
+but the registration system sends them in HL7 v2:
 
     PV1-20  Financial Class            e.g. WC  (values are site-defined)
     IN1-4   Insurance Company Name     the WC carrier or TPA
@@ -28,8 +28,12 @@ from dataclasses import asdict, dataclass, field
 from .dates import hl7_local_date
 from .hl7v2 import Message, ParseError, Segment, parse_message
 
-# Claim numbers that mean "not assigned yet" (WC EDI guides use UNKNOWN in REF*Y4).
-PLACEHOLDER_CLAIM_NUMBERS = {"", "UNKNOWN", "UNK", "PENDING", "TBD", "NONE", "N/A", "NA", "0"}
+# Values registration types when it doesn't have the real one yet (WC EDI guides use UNKNOWN in
+# REF*Y4 for a claim number not assigned yet). Such a value is not an employer, carrier or claim #.
+PLACEHOLDER_VALUES = frozenset(
+    {"UNKNOWN", "UNK", "PENDING", "TBD", "TBA", "NONE", "N/A", "NA", "NULL", "?", "-", "--"}
+)
+PLACEHOLDER_CLAIM_NUMBERS = PLACEHOLDER_VALUES | {"", "0"}
 
 DEFAULT_WC_FINANCIAL_CLASSES = frozenset({"WC", "WORKCOMP", "WORKERS COMP"})
 
@@ -54,8 +58,10 @@ class AdtWcData:
     control_id: str
     mrn: str = ""
     patient_name: str = ""
+    family_name: str = ""  # PID-5.1
+    given_name: str = ""  # PID-5.2
     birth_date: str = ""
-    visit_number: str = ""
+    visit_number: str = ""  # PV1-19, compared with the FHIR Encounter's identifiers (FIN)
     patient_class: str = ""
     financial_class: str = ""
     carrier: Sourced | None = None
@@ -84,10 +90,21 @@ def hl7_date(text: str) -> str:
     return hl7_local_date(text)
 
 
-def _first(*candidates: tuple[str, str, bool]) -> Sourced | None:
+def is_placeholder(value: str) -> bool:
+    """True for '', 'UNKNOWN', 'N/A', 'Pending'... (case and a trailing '.' ignored)."""
+    text = (value or "").strip().upper().rstrip(".")
+    return not text or text in PLACEHOLDER_VALUES
+
+
+def _first(warnings: list[str], *candidates: tuple[str, str, bool]) -> Sourced | None:
+    """The first candidate with a real value. Placeholders are skipped, with a warning."""
     for value, source, confirmed in candidates:
-        if value.strip():
-            return Sourced(value.strip(), source, confirmed)
+        if not value.strip():
+            continue
+        if is_placeholder(value):
+            warnings.append(f"{source} holds a placeholder ({value.strip()!r}); not used")
+            continue
+        return Sourced(value.strip(), source, confirmed)
     return None
 
 
@@ -133,6 +150,7 @@ def extract_wc(msg: Message) -> AdtWcData:
             pid.get(3),
         )
         family, given = pid.get(5, comp=1), pid.get(5, comp=2)
+        data.family_name, data.given_name = family, given
         data.patient_name = ", ".join(p for p in (family, given) if p)
         data.birth_date = hl7_date(pid.get(7))
 
@@ -164,10 +182,10 @@ def extract_wc(msg: Message) -> AdtWcData:
         sure = data.wc_in1 == "marked"
         n = msg.all("IN1").index(in1) + 1
         label = "IN1" if len(in1s) == 1 else f"IN1[{n}]"
-        data.carrier = _first((in1.get(4), f"{label}-4", sure))
+        data.carrier = _first(data.warnings, (in1.get(4), f"{label}-4", sure))
         data.plan_type = in1.get(15)
         claim = in1.get(36)
-        if claim.strip().upper() in PLACEHOLDER_CLAIM_NUMBERS:
+        if is_placeholder(claim) or claim.strip().upper() in PLACEHOLDER_CLAIM_NUMBERS:
             if claim.strip():
                 data.warnings.append(f"IN1-36 holds a placeholder claim number ({claim!r})")
         else:
@@ -177,6 +195,7 @@ def extract_wc(msg: Message) -> AdtWcData:
     # fields describe the guarantor's employer, and IN1-11 the insured's group employer, which
     # are often the same person/company in WC but not always: those are marked unconfirmed.
     data.employer = _first(
+        data.warnings,
         (
             _employer_name(in2, 3, id_first=True) if in2 else "",
             "IN2-3",
@@ -214,6 +233,7 @@ __all__ = [
     "Sourced",
     "extract_wc",
     "hl7_date",
+    "is_placeholder",
     "is_wc_financial_class",
     "parse_adt",
 ]

@@ -9,9 +9,14 @@ Precedence for each essential field (first one that has a value wins):
                  -> WC Coverage member id (unconfirmed: a member id is not a claim #)
     Carrier      ADT IN1-4 of the WC IN1 -> WC Coverage payor
 
-ADT wins because registration is where these are typed in, and FHIR doesn't carry most of them
-(Pip's RESEARCH.md section 2b). The card always shows which source each value came from, and
-"unconfirmed" values raise a medium gap instead of counting as done.
+ADT wins because registration is where these are typed in, and Oracle's FHIR API doesn't carry
+most of them. The card always shows which source each value came from, and "unconfirmed" values
+raise a medium gap instead of counting as done. Placeholders ('UNKNOWN', 'N/A', 'Pending'...) never
+count as a value.
+
+The ADT is only used if it is this patient's (MRN, or name + birth date) AND this visit's (PV1-19
+is one of the Encounter's identifiers, e.g. its FIN), so an A04 from another visit can't fill in
+or close anything here.
 
 Three outcomes per rule, which matters for the worklist:
   * the gap is present            -> in card.gaps
@@ -26,8 +31,14 @@ import re
 from dataclasses import asdict, dataclass, field
 from datetime import tzinfo
 
-from .adt import DEFAULT_WC_FINANCIAL_CLASSES, AdtWcData, Sourced, is_wc_financial_class
-from .dates import fhir_local_date, hl7_local_date, site_tz
+from .adt import (
+    DEFAULT_WC_FINANCIAL_CLASSES,
+    AdtWcData,
+    Sourced,
+    is_placeholder,
+    is_wc_financial_class,
+)
+from .dates import hl7_local_date, loose_local_date, site_tz
 from .fhir_facts import FhirFacts
 
 SEVERITY_ORDER = {"high": 0, "medium": 1, "low": 2, "info": 3}
@@ -38,6 +49,13 @@ CUSTOM_ATTRIBUTE_HINTS = {
     "injury_date": re.compile(r"injury date|date of injury|accident date|\bdoi\b", re.I),
     "claim_number": re.compile(r"\bclaim\s*(#|no\b|num|number\b|id\b)", re.I),
 }
+
+# A document whose type says it's about work status / return to work ("Work Status Note",
+# "Return to Work"), but not "Workup", "Network" or "Paperwork".
+WORK_DOCUMENT = re.compile(r"\bwork\b(?!-?\s*up\b)|\bRTW\b", re.I)
+
+# Name suffixes left out when comparing names (PID-5 vs FHIR HumanName).
+NAME_SUFFIXES = {"JR", "SR", "II", "III", "IV", "V"}
 
 ESSENTIALS = {
     "employer": "EMPLOYER",
@@ -82,6 +100,7 @@ WC_RULE_CODES = (
         "JOB_RELATED_NOT_FLAGGED",
         "INJURY_DX_MISSING",
         "INJURY_DATE_CONFLICT",
+        "INJURY_DATE_AFTER_VISIT",
         "OCCUPATION_MISSING",
     }
 )
@@ -94,6 +113,7 @@ ADT_DEPENDENT_CODES = (
     | {f"{p}_UNCONFIRMED" for p in ESSENTIALS.values()}
     | {
         "INJURY_DATE_CONFLICT",
+        "INJURY_DATE_AFTER_VISIT",
         "WC_STATUS_UNCLEAR",
         "JOB_RELATED_CONFLICT",
         "JOB_RELATED_NOT_FLAGGED",
@@ -126,6 +146,10 @@ class ReadinessCard:
     wc_signals: list[str]
     patient_match: str
     adt_matched: bool = True  # False also when the match couldn't be checked
+    # The ADT is this patient's, but its PV1-19 visit number isn't this Encounter (another visit).
+    adt_visit_mismatch: bool = False
+    # Whether PV1-19 could be compared with the Encounter's identifiers at all.
+    adt_visit_checked: bool = False
     wc_status: str = "wc"  # wc | not_wc | unclear | unknown
     site_tz: str = ""
     wc_classes: list[str] = field(default_factory=list)  # the PV1-20 values that meant WC
@@ -228,17 +252,84 @@ class ReadinessCard:
 def _from_custom_attributes(
     attrs: dict[str, str], key: str, tz: tzinfo | None = None
 ) -> Sourced | None:
+    """The first matching custom attribute with a real value. Placeholders ('UNKNOWN', 'N/A',
+    'Pending'...) and, for the injury date, values that aren't a date are skipped (the card
+    lists them as CUSTOM_ATTRIBUTE_IGNORED)."""
     for name, value in attrs.items():
-        if value.strip() and CUSTOM_ATTRIBUTE_HINTS[key].search(name):
+        usable = _custom_value_problem(key, value, tz) is None
+        if usable and CUSTOM_ATTRIBUTE_HINTS[key].search(name):
             value = value.strip()
             if key == "injury_date":
-                value = fhir_local_date(value, tz) or value
+                value = loose_local_date(value, tz)
             return Sourced(value, f"Encounter custom attribute '{name}'")
     return None
 
 
+def _custom_value_problem(key: str, value: str, tz: tzinfo | None) -> str | None:
+    """Why a custom attribute's value can't be used for `key`, or None if it can."""
+    if not value.strip():
+        return "empty"
+    if is_placeholder(value):
+        return "placeholder"
+    if key == "injury_date" and not loose_local_date(value, tz):
+        return "not a date"
+    return None
+
+
+def _ignored_custom_attributes(attrs: dict[str, str], tz: tzinfo) -> list[str]:
+    out = []
+    for name, value in attrs.items():
+        for key, hint in CUSTOM_ATTRIBUTE_HINTS.items():
+            problem = _custom_value_problem(key, value, tz)
+            if hint.search(name) and problem not in (None, "empty"):
+                out.append(f"'{name}' = {value.strip()!r} ({problem})")
+                break
+    return out
+
+
 def _first(*values: Sourced | None) -> Sourced | None:
     return next((v for v in values if v is not None and v.value), None)
+
+
+def _name_key(family: str, given: str, display: str) -> tuple[str, str]:
+    """(family, first given) upper-cased, letters/digits only, suffixes dropped, so 'Smith, Jane
+    Marie' matches PID-5 'SMITH^JANE' and "O'Brien Jr." matches 'OBRIEN'. Without structured
+    parts, a display name 'Family, Given ...' (or 'Given ... Family') is split."""
+    if not (family or given) and display:
+        if "," in display:
+            family, given = display.split(",", 1)
+        else:
+            words = display.split()
+            family, given = (words[-1], words[0]) if len(words) > 1 else (display, "")
+
+    def tokens(text: str) -> list[str]:
+        return [t for t in re.split(r"[^A-Z0-9]+", text.upper()) if t]
+
+    fam = "".join(t for t in tokens(family) if t not in NAME_SUFFIXES)
+    giv = next((t for t in tokens(given) if t not in NAME_SUFFIXES), "")
+    return fam, giv
+
+
+def _same_name(fhir: FhirFacts, adt: AdtWcData) -> bool:
+    a = _name_key(adt.family_name, adt.given_name, adt.patient_name)
+    f = _name_key(fhir.family_name, fhir.given_name, fhir.patient_name)
+    return all(a) and a == f
+
+
+def _norm_visit_id(value: str) -> str:
+    """Visit numbers are compared without case, spaces or leading zeros (0016137 == 16137)."""
+    text = re.sub(r"\s+", "", value or "").upper()
+    return text.lstrip("0") or ("0" if text else "")
+
+
+def _visit_match(fhir: FhirFacts, adt: AdtWcData) -> bool | None:
+    """Is the ADT's PV1-19 one of this Encounter's identifiers (e.g. its FIN)? None = can't tell
+    (no PV1-19, or no Encounter identifiers to compare with)."""
+    visit = _norm_visit_id(adt.visit_number)
+    ids = {_norm_visit_id(i) for i in fhir.encounter_identifiers} - {""}
+    if not visit or not ids:
+        return None
+    return visit in ids
 
 
 def _patient_match(fhir: FhirFacts, adt: AdtWcData | None) -> tuple[str, bool, bool]:
@@ -248,7 +339,7 @@ def _patient_match(fhir: FhirFacts, adt: AdtWcData | None) -> tuple[str, bool, b
         return "no ADT message supplied", False, False
     if "Patient" in fhir.errors:
         return "could not check (FHIR Patient read failed)", False, False
-    same_name = bool(adt.patient_name) and adt.patient_name.lower() == fhir.patient_name.lower()
+    same_name = _same_name(fhir, adt)
     same_dob = bool(adt.birth_date) and adt.birth_date == fhir.birth_date
     all_present = all((adt.patient_name, adt.birth_date, fhir.patient_name, fhir.birth_date))
     if adt.mrn and adt.mrn in fhir.mrns and all_present and not same_name and not same_dob:
@@ -288,6 +379,19 @@ def build_card(
     dx_onset = next((c for c in injury_dx if c.onset), None)
 
     match_text, matched, demographics_differ = _patient_match(fhir, adt)
+    visit_mismatch = visit_checked = False
+    if matched and adt is not None:
+        # Same patient is not enough: an A04 from another visit (an old claim, a non-WC visit)
+        # must not fill in, or close items on, this one.
+        visit = _visit_match(fhir, adt)
+        visit_checked = visit is not None
+        if visit is False:
+            matched, visit_mismatch = False, True
+            match_text = (
+                f"NOT MATCHED: same patient ({match_text}), but PV1-19 visit {adt.visit_number} "
+                f"is not this Encounter (identifiers: {', '.join(fhir.encounter_identifiers[:3])})"
+            )
+            demographics_differ = False
     use_adt = adt if matched else None
     adt_employer = use_adt.employer if use_adt else None
     adt_injury = hl7_local_date(use_adt.injury_date_raw, tz) if use_adt else ""
@@ -343,6 +447,8 @@ def build_card(
         wc_signals=signals,
         patient_match=match_text,
         adt_matched=matched,
+        adt_visit_mismatch=visit_mismatch,
+        adt_visit_checked=visit_checked,
         site_tz=str(tz),
         wc_classes=sorted({c.strip().upper() for c in wc_financial_classes}),
     )
@@ -473,7 +579,7 @@ def _find_gaps(
 
     # --- Is the ADT about this patient? ---------------------------------------------------
     if adt is None:
-        unchecked |= {"ADT_PATIENT_MISMATCH", "ADT_DEMOGRAPHICS_DIFFER"}
+        unchecked |= {"ADT_PATIENT_MISMATCH", "ADT_DEMOGRAPHICS_DIFFER", "ADT_VISIT_MISMATCH"}
         add(
             Gap(
                 "NO_ADT",
@@ -484,7 +590,21 @@ def _find_gaps(
             )
         )
     elif "Patient" in fhir.errors:
-        unchecked |= {"ADT_PATIENT_MISMATCH", "ADT_DEMOGRAPHICS_DIFFER"}
+        unchecked |= {"ADT_PATIENT_MISMATCH", "ADT_DEMOGRAPHICS_DIFFER", "ADT_VISIT_MISMATCH"}
+    elif card.adt_visit_mismatch:
+        add(
+            Gap(
+                "ADT_VISIT_MISMATCH",
+                "high",
+                f"The ADT message is for this patient but another visit (PV1-19 "
+                f"{adt.visit_number}; this Encounter's identifiers: "
+                f"{', '.join(fhir.encounter_identifiers) or 'none'}). Its WC fields were NOT "
+                "used, and ADT-based items were left as they were.",
+                "Use the A04 for this visit (its PV1-19 should be this encounter's FIN).",
+                key=f"visit={_norm_visit_id(adt.visit_number)}",
+            )
+        )
+        unchecked.add("ADT_DEMOGRAPHICS_DIFFER")
     elif not card.adt_matched:
         add(
             Gap(
@@ -496,7 +616,7 @@ def _find_gaps(
                 key=f"adt_mrn={adt.mrn}",
             )
         )
-        unchecked.add("ADT_DEMOGRAPHICS_DIFFER")
+        unchecked |= {"ADT_DEMOGRAPHICS_DIFFER", "ADT_VISIT_MISMATCH"}
     elif demographics_differ:
         add(
             Gap(
@@ -512,6 +632,31 @@ def _find_gaps(
     if adt_usable:
         for warning in adt.warnings:
             add(Gap("ADT_WARNING", "info", warning))
+        if not card.adt_visit_checked:
+            unchecked.add("ADT_VISIT_MISMATCH")
+            add(
+                Gap(
+                    "ADT_VISIT_UNVERIFIED",
+                    "info",
+                    "Couldn't confirm the ADT is for this visit: "
+                    + (
+                        "PV1-19 (visit number) is empty."
+                        if not adt.visit_number.strip()
+                        else "the Encounter has no identifiers to compare PV1-19 with."
+                    ),
+                    "Check the message's visit number against the encounter's FIN.",
+                )
+            )
+    ignored = _ignored_custom_attributes(fhir.custom_attributes, tz)
+    if ignored:
+        add(
+            Gap(
+                "CUSTOM_ATTRIBUTE_IGNORED",
+                "info",
+                "Encounter custom attribute(s) not used: " + "; ".join(ignored) + ".",
+                "Registration should enter the real value (or leave it blank).",
+            )
+        )
 
     # --- Is this a WC visit? -----------------------------------------------------------------
     if card.wc_status == "not_wc":
@@ -597,6 +742,27 @@ def _find_gaps(
                 )
             )
 
+    injury = ess.get("injury_date")
+    visit_day = fhir.encounter_date
+    if injury is None or not visit_day:
+        if "INJURY_DATE_MISSING" in unchecked or not visit_day:
+            unchecked.add("INJURY_DATE_AFTER_VISIT")
+    elif re.fullmatch(r"\d{4}-\d{2}-\d{2}", injury.value) and injury.value > visit_day:
+        # Blocking when the date was typed as the injury date (ACC-1, custom attribute). A
+        # diagnosis onset only stands in for it and may just be the documentation date (an
+        # overnight ED visit), so then it's a medium "check this".
+        add(
+            Gap(
+                "INJURY_DATE_AFTER_VISIT",
+                "high" if injury.confirmed else "medium",
+                f"Injury date {injury.value} ({injury.source}) is after this visit started "
+                f"({visit_day}). One of them is wrong, and a wrong date of injury gets the "
+                "claim denied.",
+                "Confirm the date of injury with the patient and fix it in registration.",
+                key=f"{injury.value}|{injury.source}|{visit_day}",
+            )
+        )
+
     if adt is None:
         # Without the ADT, an essential that isn't found is still reported, but an earlier
         # ADT-based gap can't be confirmed as fixed: don't let a forgotten --adt close items.
@@ -668,7 +834,7 @@ def _find_gaps(
                 "Ask job title during nursing intake.",
             )
         )
-    if not any("work" in d.lower() for d in fhir.documents):
+    if not any(WORK_DOCUMENT.search(d) for d in fhir.documents):
         add(
             Gap(
                 "WORK_STATUS_NOTE_MISSING",
@@ -693,7 +859,7 @@ def _injury_date_candidates(card: ReadinessCard, tz: tzinfo) -> list[Sourced]:
         if adt_date:
             out.append(Sourced(adt_date, "ACC-1"))
     attr = _from_custom_attributes(card.fhir.custom_attributes, "injury_date", tz)
-    if attr and fhir_local_date(attr.value, tz):
+    if attr:  # only ever a real, parsed date
         out.append(attr)
     out.extend(
         Sourced(c.onset, f"Condition/{c.id} onset") for c in card.fhir.injury_conditions if c.onset
