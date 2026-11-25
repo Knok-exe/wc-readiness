@@ -54,14 +54,22 @@ def _origin(parts) -> tuple[str, str, int | None] | None:
     return scheme, (parts.hostname or "").lower(), port or _DEFAULT_PORTS.get(scheme)
 
 
+# What a decoded next-link path may contain: RFC 3986 unreserved + sub-delims + ':' '@' '/'.
+# No '%' (double encoding), no '\\', no spaces, control or non-ASCII characters (overlong UTF-8,
+# fullwidth dots, '‥' and the like decode to those).
+_SAFE_PATH = re.compile(r"[A-Za-z0-9._~!$&'()*+,;=:@/-]*")
+
+
 def same_server(url: str, base_url: str) -> bool:
     """True if `url` is on the same scheme + host + port as `base_url` (default ports filled in,
     so :443 is the same as no port) and under its path. A plain startswith() would accept
-    https://fhir.example.com.attacker.net/...; a server could also resolve '.'/'..' segments to
-    a path outside the base, so these are refused in every disguise we know of: encoded once
-    (%2e%2e), with ';' path parameters (..;/ on Java servers), split by a backslash (also
-    %5c, a separator on IIS), or encoded twice (any '%' left after one decode is refused: a
-    server's own next links never need it). Any userinfo, even an empty '@', is refused."""
+    https://fhir.example.com.attacker.net/...
+
+    The path, decoded once, must be plain ASCII URL characters (see _SAFE_PATH), and none of
+    its segments may be dots only ('.', '..', '...'; ';params' are stripped first, for '..;/'
+    on Java servers) or empty in the middle ('//evil.com/x'). That covers the common ways a
+    server could be talked into resolving a path outside the base. Any userinfo, even an
+    empty '@', is refused."""
     if "\\" in url:
         return False
     u, b = urlsplit(url), urlsplit(base_url)
@@ -71,10 +79,14 @@ def same_server(url: str, base_url: str) -> bool:
     if origin is None or not origin[1] or origin != _origin(b):
         return False
     path = unquote(u.path)
-    if "%" in path:
+    if not _SAFE_PATH.fullmatch(path):
         return False
-    for seg in re.split(r"[/\\]", path):
-        if seg.split(";", 1)[0] in (".", ".."):
+    segments = path.split("/")
+    for i, seg in enumerate(segments):
+        name = seg.split(";", 1)[0]
+        if name and name.strip(".") == "":
+            return False
+        if not seg and 0 < i < len(segments) - 1:
             return False
     base_path = b.path.rstrip("/")
     return u.path == base_path or u.path.startswith(base_path + "/")

@@ -136,6 +136,10 @@ class ReadinessCard:
     # gaps this run couldn't re-check that are still open, in progress, or done but flagged as
     # still present. They come from the last ADT run and still block readiness.
     held_blocking: list[str] = field(default_factory=list)
+    # Also set by Worklist.assess on such a run: items for those gaps that a coordinator marked
+    # `done` but no ADT run has confirmed gone yet. They don't block (done is a deliberate
+    # decision), but the status line says so, so READY isn't read as verified.
+    done_unconfirmed: list[str] = field(default_factory=list)
     gaps: list[Gap] = field(default_factory=list)
     unchecked: set[str] = field(default_factory=set)
 
@@ -176,6 +180,12 @@ class ReadinessCard:
             text += (
                 f" [{self.provisional_count} provisional ADT-based gap(s) not re-checked: no "
                 "matching ADT this run, so the worklist items from the last ADT run stand]"
+            )
+        if self.done_unconfirmed:
+            n = len(self.done_unconfirmed)
+            text += (
+                f" [{n} item(s) marked done not yet confirmed by an ADT: "
+                f"{', '.join(self.done_unconfirmed)}]"
             )
         return text
 

@@ -179,19 +179,27 @@ class Worklist:
             return
         try:
             self.conn.executescript(SCHEMA)
-            for table, migrations in (("work_items", MIGRATIONS), ("cases", CASE_MIGRATIONS)):
-                have = {r["name"] for r in self.conn.execute(f"PRAGMA table_info({table})")}
-                for column, ddl in migrations.items():
-                    if column not in have:
-                        self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
-                        if column == "adt_seen":
-                            # Older DBs didn't record it. Assume yes, so the safe rule applies
-                            # (a run without ADT can't change ADT-dependent items).
-                            self.conn.execute("UPDATE cases SET adt_seen = 1")
+            if self._missing_columns():
+                # Take the write lock, then look again: two runs opening a new or old file at
+                # the same moment would otherwise both try to add the same column.
+                self.conn.execute("BEGIN IMMEDIATE")
+                for table, column, ddl in self._missing_columns():
+                    self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+                    if column == "adt_seen":
+                        # Older DBs didn't record it. Assume yes, so the safe rule applies
+                        # (a run without ADT can't change ADT-dependent items).
+                        self.conn.execute("UPDATE cases SET adt_seen = 1")
             self.conn.commit()
         except sqlite3.Error:
             self.conn.close()
             raise
+
+    def _missing_columns(self) -> list[tuple[str, str, str]]:
+        out = []
+        for table, migrations in (("work_items", MIGRATIONS), ("cases", CASE_MIGRATIONS)):
+            have = self._columns(table)
+            out += [(table, c, ddl) for c, ddl in migrations.items() if c not in have]
+        return out
 
     # ---- site settings ------------------------------------------------------------------------
 
@@ -443,6 +451,7 @@ class Worklist:
         the worklist is written (sync and card --no-worklist both call this)."""
         card.provisional_ignored = False
         card.held_blocking = []
+        card.done_unconfirmed = []
         tables = self._tables()
         if not card.has_case or "cases" not in tables:
             return False
@@ -464,6 +473,20 @@ class Worklist:
             (card.case_key, STILL_PRESENT),
         )
         card.held_blocking = [r["gap_code"] for r in rows if r["gap_code"] in held]
+        # `done` items whose gap no run with an ADT has seen gone yet (present is cleared only
+        # when a run that could check the gap found it gone; older files: assume not).
+        item_cols = self._columns("work_items")
+        present = "present" if "present" in item_cols else "1"
+        rows = self.conn.execute(
+            f"SELECT gap_code FROM work_items WHERE case_key = ? AND status = 'done' "
+            f"AND {present} = 1 ORDER BY gap_code",
+            (card.case_key,),
+        )
+        card.done_unconfirmed = [
+            r["gap_code"]
+            for r in rows
+            if r["gap_code"] in held and r["gap_code"] not in card.held_blocking
+        ]
         return adt_seen
 
     def _close_not_wc(self, row, card, key, now, actor, counts) -> None:
