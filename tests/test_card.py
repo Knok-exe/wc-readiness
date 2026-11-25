@@ -207,6 +207,19 @@ def test_injury_date_after_visit_blocks(demo_source, complete_a04):
     assert not card.ready
 
 
+def test_injury_date_after_visit_from_diagnosis_onset_is_medium(demo_source):
+    """No ACC-1 or custom attribute: the date is the diagnosis onset, which may just be when
+    it was documented (an overnight ED visit), so it's flagged but doesn't block."""
+    facts = gather(demo_source, "demo-wc-1001", "demo-enc-1001")  # WC coverage: a WC visit
+    facts.custom_attributes = {}
+    for c in facts.conditions:
+        c.onset = "2026-11-18"  # visit started 2026-11-17
+    card = build_card(facts, None)
+    assert card.essentials["injury_date"].source.startswith("Condition/")
+    gap = next(g for g in card.gaps if g.code == "INJURY_DATE_AFTER_VISIT")
+    assert gap.severity == "medium"
+
+
 def test_injury_date_before_or_on_visit_day_is_fine(demo_source, complete_a04):
     card = build_card(gather(demo_source, "demo-wc-1001", "demo-enc-1001"), parse_adt(complete_a04))
     assert "INJURY_DATE_AFTER_VISIT" not in codes(card)

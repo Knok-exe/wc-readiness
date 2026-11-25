@@ -748,10 +748,13 @@ def _find_gaps(
         if "INJURY_DATE_MISSING" in unchecked or not visit_day:
             unchecked.add("INJURY_DATE_AFTER_VISIT")
     elif re.fullmatch(r"\d{4}-\d{2}-\d{2}", injury.value) and injury.value > visit_day:
+        # Blocking when the date was typed as the injury date (ACC-1, custom attribute). A
+        # diagnosis onset only stands in for it and may just be the documentation date (an
+        # overnight ED visit), so then it's a medium "check this".
         add(
             Gap(
                 "INJURY_DATE_AFTER_VISIT",
-                "high",
+                "high" if injury.confirmed else "medium",
                 f"Injury date {injury.value} ({injury.source}) is after this visit started "
                 f"({visit_day}). One of them is wrong, and a wrong date of injury gets the "
                 "claim denied.",

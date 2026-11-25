@@ -322,7 +322,7 @@ a one-day conflict.
 | `EMPLOYER_MISSING`, `INJURY_DATE_MISSING`, `CLAIM_NUMBER_MISSING`, `CARRIER_MISSING` | high | essential not found in any source |
 | `ADT_PATIENT_MISMATCH` | high | the ADT is for someone else; its fields were ignored |
 | `ADT_VISIT_MISMATCH` | high | the ADT is this patient's but another visit (PV1-19); its fields were ignored |
-| `INJURY_DATE_AFTER_VISIT` | high | the injury date is later than the visit's start date |
+| `INJURY_DATE_AFTER_VISIT` | high (medium if the date is only a diagnosis onset) | the injury date is later than the visit's start date |
 | `JOB_RELATED_CONFLICT` | high | ACC-5 = N on a visit registered as WC |
 | `EMPLOYER_UNCONFIRMED`, `CLAIM_NUMBER_UNCONFIRMED`, `CARRIER_UNCONFIRMED`, `INJURY_DATE_UNCONFIRMED` | medium | found only in a source that may not be the WC value |
 | `WC_STATUS_UNCLEAR` | medium | injury/accident but no WC signal |
