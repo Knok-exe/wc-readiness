@@ -119,12 +119,13 @@ def render_card(card: ReadinessCard) -> str:
 def render_worklist(items: list[WorkItem]) -> str:
     if not items:
         return "Worklist: nothing to do."
-    header = f"{'ID':>3}  {'Status':<11} {'Sev':<6} {'Patient':<20} {'Item':<26} "
-    header += f"{'Owner':<12} Flag"
+    header = f"{'ID':>3}  {'Status':<11} {'Sev':<6} {'Patient':<20} {'Visit':<14} "
+    header += f"{'Item':<26} {'Owner':<12} Flag"
     lines = ["Coordinator worklist", header, "-" * len(header)]
     lines.extend(
         f"{it.id:>3}  {it.status:<11} {it.severity:<6} {it.patient_name[:20]:<20} "
-        f"{it.gap_code[:26]:<26} {(it.owner or '-')[:12]:<12} {it.flag}".rstrip()
+        f"{it.encounter_id[:14]:<14} {it.gap_code[:26]:<26} {(it.owner or '-')[:12]:<12} "
+        f"{it.flag}".rstrip()
         for it in items
     )
     return clean("\n".join(lines))

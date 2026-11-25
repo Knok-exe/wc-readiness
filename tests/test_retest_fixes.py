@@ -78,6 +78,7 @@ def legacy_w_db(tmp_path, demo_data, incomplete_a04):
         wl.sync(card)
         wl.update(wl.items()[0].id, status="in_progress", owner="Knok")
         wl.conn.execute("DELETE FROM settings")  # = no settings table content in old versions
+        wl.conn.execute("DROP TRIGGER audit_log_no_delete")  # older DBs had none
         wl.conn.execute("DELETE FROM audit_log WHERE item_id IS NULL")
         wl.conn.commit()
     return db, adt_path, nodx

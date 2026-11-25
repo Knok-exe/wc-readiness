@@ -86,3 +86,16 @@ def test_bad_adt_file(tmp_path, capsys):
     assert cli.main(["adt", str(bad)]) == 1
     assert "not a valid HL7 v2 message" in capsys.readouterr().err
     assert cli.main(["adt", str(tmp_path / "missing.hl7")]) == 1
+
+
+def test_update_actor_defaults_to_the_os_user(offline_card_command, tmp_path, monkeypatch, capsys):
+    db = str(tmp_path / "wl.db")
+    adt = str(EXAMPLES / "a04_wc_incomplete.hl7")
+    cli.main(["card", "--patient", "demo-wc-1002", "--adt", adt, "--db", db])
+    monkeypatch.setattr(cli.getpass, "getuser", lambda: "jdoe")
+    assert cli.main(["update", "1", "--status", "in_progress", "--db", db]) == 0
+    assert cli.main(["update", "1", "--owner", "Knok", "--actor", "Knok", "--db", db]) == 0
+    capsys.readouterr()
+    assert cli.main(["audit", "--db", db]) == 0
+    updates = [line for line in capsys.readouterr().out.splitlines() if " updated " in line]
+    assert "jdoe" in updates[0] and "Knok" in updates[1]

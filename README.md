@@ -54,7 +54,7 @@ wc-readiness adt examples/messages/a04_wc_incomplete.hl7   # what WC fields are 
 wc-readiness worklist                                      # open items in wc_worklist.db
 wc-readiness update 1 --status in_progress --owner "Knok"  # work an item
 wc-readiness update 2 --status dismissed --note "not used at our site"   # dismissing needs a note
-wc-readiness audit                                         # who changed what, when
+wc-readiness audit                                         # who changed what, when (append-only)
 
 pytest -q            # tests never touch the network
 ruff check . && ruff format --check .
@@ -88,10 +88,16 @@ and the case's history), so it gives the same verdict a normal run would. Withou
 can't know whether the visit ever had an ADT, so provisional gaps count, and it says so.
 
 **Safety checks.** If the Encounter you pass belongs to a different patient, or doesn't say which
-patient it belongs to, `card` stops with exit 1 and writes nothing. Patient and encounter ids must be plain FHIR ids (letters, digits, `-`
-and `.`). `worklist`, `update` and `audit` only open an existing DB, so a mistyped `--db` is an
-error instead of an empty list. A new DB file is created readable by you only (it holds patient
-names).
+patient it belongs to, `card` stops with exit 1 and writes nothing. An ADT message is only used if
+it's for this patient **and this visit** (its PV1-19 visit number is one of the Encounter's
+identifiers, such as the FIN). Patient and encounter ids must be plain FHIR ids (letters,
+digits, `-` and `.`). `worklist`, `update` and `audit` only open an existing DB, so a mistyped
+`--db` is an error instead of an empty list. On macOS/Linux a new DB file is created readable by
+you only (it holds patient names); on Windows that permission doesn't apply, so keep the file in
+a folder only you can read.
+
+**Audit.** `update` records who made each change: your login name, unless you pass `--actor`.
+The audit log is append-only (the DB refuses edits and deletes to it).
 
 ---
 
@@ -142,7 +148,8 @@ field 20". The fields this tool reads (HL7 v2.5.1 numbering):
 | Field | Name | Used for |
 |---|---|---|
 | PID-3, PID-5, PID-7 | Patient ID (MRN), name, birth date | matching the message to the FHIR patient |
-| PV1-19, PV1-20 | Visit number, **Financial Class** | FC `WC` = "this visit is workers' comp" (site-defined values) |
+| PV1-19 | Visit number | must be one of the FHIR Encounter's identifiers (FIN), so the ADT is for **this** visit |
+| PV1-20 | **Financial Class** | FC `WC` = "this visit is workers' comp" (site-defined values) |
 | IN1-4 | Insurance company name | WC carrier / TPA |
 | IN1-15 | Plan type | shown for reference |
 | IN1-36 | Policy number | **claim number** by common convention (`UNKNOWN` counts as missing) |
@@ -167,7 +174,9 @@ sandbox, so whether your hospital's WC plans really come out as 95 is question #
 Oracle exposes site-defined registration fields on `Encounter` as extensions called **custom
 attributes** (e.g. "Complete Reg?" in the sandbox). If a site captures the injury date or claim # in
 one, this tool will find it by name ("Claim #"/"Claim Number", "Injury Date", "Employer"...;
-"Claim Status" or "Employer Phone" don't count).
+"Claim Status" or "Employer Phone" don't count). Placeholders such as `UNKNOWN`, `N/A` or
+`Pending`, and injury dates that aren't a date (ISO or `MM/DD/YYYY`), are skipped and listed as
+`CUSTOM_ATTRIBUTE_IGNORED`.
 
 ### The worklist (and why it's ours)
 
@@ -175,7 +184,8 @@ Oracle's FHIR API has **no `Task` resource** (Pip checked both CapabilityStateme
 nowhere in the EHR to keep "chase claim # for this visit". The app keeps its own list in SQLite:
 
 - each blocking/medium/low **gap** becomes a **work item** (`open`);
-- the coordinator moves it to `in_progress`, `done` or `dismissed` (dismissing needs a note), with
+- the coordinator moves it to `in_progress`, `done` or `dismissed` (dismissing needs a note in
+  that same update: an older note doesn't count), with
   an owner;
 - re-checking a visit **syncs** the list, with these rules:
   - a gap that was checked and is gone closes its open item as `resolved` (only the system sets
@@ -212,7 +222,7 @@ nowhere in the EHR to keep "chase claim # for this visit". The app keeps its own
     `dismissed` (with a note). If it is WC, get registration to fix PV1-20 and re-run: the flag
     clears itself. Setting it to `in_progress` again keeps working it and hides the flag;
   - nothing is duplicated, and severity/text changes on open items are recorded too;
-- every change goes into an **audit_log** table (who, what, when in UTC).
+- every change goes into an **audit_log** table (who, what, when in UTC). It's append-only.
 
 ## How the pieces fit
 
@@ -275,13 +285,23 @@ marked *unconfirmed* are shown but raise a medium `..._UNCONFIRMED` gap instead 
 | Claim # | ADT IN1-36 of the WC IN1 | Encounter custom attribute | WC `Coverage` member id (*unconfirmed*: a member id isn't a claim #) |
 | Carrier | ADT IN1-4 of the WC IN1 | WC `Coverage.payor` | n/a |
 
+**Placeholders aren't values.** `UNKNOWN`, `UNK`, `N/A`, `NA`, `NONE`, `PENDING`, `TBD`, `?` and
+the like are skipped in every source (IN1-4, IN1-36, IN2-3, GT1, IN1-11, custom attributes), with
+a warning on the card, so `Employer: UNKNOWN` can't make a visit READY.
+
 **Which IN1?** A message can carry several insurances (IN1 segments). The tool uses the one marked
 as WC by IN1-15 plan type or IN1-2 plan id (e.g. `WC`, "Workers Comp"). If there's only one IN1 and
 it isn't marked, it's used but *unconfirmed*; with several unmarked IN1s, none is used.
 
 ADT comes first because registration is where these get typed, and most aren't in Oracle's FHIR at
 all. ADT fields are **only used if the message matches the FHIR patient** (by MRN, or name + birth
-date); otherwise the card raises `ADT_PATIENT_MISMATCH` instead of mixing two people's data. A
+date); otherwise the card raises `ADT_PATIENT_MISMATCH` instead of mixing two people's data.
+Names are compared on family name + first given name, ignoring case, punctuation, middle names
+and suffixes (Jr, Sr, II...). The message must also be for **this visit**: if PV1-19 isn't one of
+the Encounter's identifiers (compared without case or leading zeros), the card raises
+`ADT_VISIT_MISMATCH` and ignores the ADT, so an old claim's A04 can't fill in a new visit. If
+PV1-19 is empty or the Encounter has no identifiers, the ADT is used and the card notes
+`ADT_VISIT_UNVERIFIED`. A
 matching MRN with a different name **and** a different birth date counts as a mismatch too (an
 MRN typo or a collision). If PID-3 repeats, the repetition typed `MR` is used.
 
@@ -301,6 +321,8 @@ a one-day conflict.
 | `WC_COVERAGE_MISSING` | high | no Coverage typed 95/951/953/954/959/WCBPOL (says so if PV1-20 claims WC) |
 | `EMPLOYER_MISSING`, `INJURY_DATE_MISSING`, `CLAIM_NUMBER_MISSING`, `CARRIER_MISSING` | high | essential not found in any source |
 | `ADT_PATIENT_MISMATCH` | high | the ADT is for someone else; its fields were ignored |
+| `ADT_VISIT_MISMATCH` | high | the ADT is this patient's but another visit (PV1-19); its fields were ignored |
+| `INJURY_DATE_AFTER_VISIT` | high | the injury date is later than the visit's start date |
 | `JOB_RELATED_CONFLICT` | high | ACC-5 = N on a visit registered as WC |
 | `EMPLOYER_UNCONFIRMED`, `CLAIM_NUMBER_UNCONFIRMED`, `CARRIER_UNCONFIRMED`, `INJURY_DATE_UNCONFIRMED` | medium | found only in a source that may not be the WC value |
 | `WC_STATUS_UNCLEAR` | medium | injury/accident but no WC signal |
@@ -309,7 +331,7 @@ a one-day conflict.
 | `INJURY_DATE_CONFLICT` | medium | sources disagree on the (local) injury date |
 | `INJURY_DX_MISSING` | medium | no ICD-10-CM injury code linked to the encounter (S, T00-T77/T79, V00-Y38; not T78 allergies, T80-T88 or Y39-Y99 care complications) |
 | `OCCUPATION_MISSING` | low | no occupation in social history |
-| `NOT_WC_VISIT`, `WC_STATUS_UNKNOWN`, `NO_ADT`, `ADT_WARNING`, `WC_COVERAGE_INACTIVE`, `COVERAGE_OTHER_PATIENT`, `ENCOUNTER_ID_CHANGED`, `WORK_STATUS_NOTE_MISSING`, `FHIR_READ_FAILED:*` | info | context; not put on the worklist |
+| `NOT_WC_VISIT`, `WC_STATUS_UNKNOWN`, `NO_ADT`, `ADT_WARNING`, `ADT_VISIT_UNVERIFIED`, `CUSTOM_ATTRIBUTE_IGNORED`, `WC_COVERAGE_INACTIVE`, `COVERAGE_OTHER_PATIENT`, `ENCOUNTER_ID_CHANGED`, `WORK_STATUS_NOTE_MISSING`, `FHIR_READ_FAILED:*` | info | context; not put on the worklist |
 
 **READY** = a WC visit with no high gaps, no high worklist item still blocking from the last ADT
 run (see the provisional rule above), and every FHIR read working. If a read failed (the sandbox
@@ -339,13 +361,13 @@ WC essentials
   Custom attrs   Complete Reg? = No; Injury Date = 2026-11-21T02:15:00Z (2026-11-20 local)
 ...
 Coordinator worklist
- ID  Status      Sev    Patient              Item                       Owner        Flag
------------------------------------------------------------------------------------------
-  1  open        high   Sampleperson, Casey  CLAIM_NUMBER_MISSING       -
-  2  open        high   Sampleperson, Casey  EMPLOYER_MISSING           -
-  3  open        high   Sampleperson, Casey  WC_COVERAGE_MISSING        -
-  4  open        medium Sampleperson, Casey  JOB_RELATED_NOT_FLAGGED    -
-  5  open        low    Sampleperson, Casey  OCCUPATION_MISSING         -
+ ID  Status      Sev    Patient              Visit          Item                       Owner        Flag
+--------------------------------------------------------------------------------------------------------
+  1  open        high   Sampleperson, Casey  demo-enc-1002  CLAIM_NUMBER_MISSING       -
+  2  open        high   Sampleperson, Casey  demo-enc-1002  EMPLOYER_MISSING           -
+  3  open        high   Sampleperson, Casey  demo-enc-1002  WC_COVERAGE_MISSING        -
+  4  open        medium Sampleperson, Casey  demo-enc-1002  JOB_RELATED_NOT_FLAGGED    -
+  5  open        low    Sampleperson, Casey  demo-enc-1002  OCCUPATION_MISSING         -
 ```
 
 Notice the custom attribute's injury date: in UTC it's Nov 21, but in New York it's the evening of
@@ -373,7 +395,7 @@ PowerChart/FirstNet is a different matter:
 - Before that: Phase 1 (Knok's own CernerCare + code Console registration, secure sandbox, EHR
   launch, writing a work status note as a `DocumentReference`), then Phase 2 with hospital IT (an
   outbound ADT feed filtered to the WC financial class, the site's ADT spec, hosting and security
-  review). See Pip's `RESEARCH.md` section 5.
+  review).
 
 ### The lower-code alternative: CCL report or MPage
 
@@ -399,7 +421,8 @@ worth asking IT about before going further than Phase 1.
   linked to the encounter, minus allergies (T78) and complications of care (T80-T88, Y39-Y99).
 - **Claim # in IN1-36** is a convention, not a standard. Some sites use IN1-49 or a custom attribute.
 - **Custom attributes are matched by name**, which is fragile; production should use attribute ids.
-- **Latest encounter** (when `--encounter` is omitted) is picked from the first 20 results only.
+- **Latest encounter** (when `--encounter` is omitted) is picked from up to 5 pages of 20; a
+  patient with more encounters than that gets a failed Encounter read, so pass `--encounter`.
 - **The sandbox is shared and slow.** Its data changes; Condition searches return the patient's whole
   problem list (1,700+ items) and sometimes time out. The tool filters client-side and reports
   failed reads instead of crashing; failed reads never close worklist items.
@@ -415,7 +438,7 @@ worth asking IT about before going further than Phase 1.
 - **PHI in the DB.** The worklist file holds names and gap text (employer, claim #, dates) in
   plain SQLite. Fine for synthetic data; Phase 1 needs PHI out of messages and encryption at rest.
 - **Not done yet:** HL7 table validation, A08/A03/A11 handling, PHI-safe logging, a committed lock
-  file (Dependabot is set up), the coordinator UI (Phase 0 is CLI-only).
+  file (`uv.lock` is no longer git-ignored: run `uv lock` and commit it), the coordinator UI (Phase 0 is CLI-only).
 
 ## Reuse of hl7v2-to-fhir
 

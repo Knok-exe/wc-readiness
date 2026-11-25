@@ -1,10 +1,12 @@
 import itertools
+import sqlite3
 
 import pytest
 
 from wc_readiness.adt import parse_adt
 from wc_readiness.card import build_card
 from wc_readiness.fhir_facts import gather
+from wc_readiness.render import render_worklist
 from wc_readiness.worklist import Worklist
 
 
@@ -104,3 +106,47 @@ def test_default_clock_is_utc_iso(cards):
     wl = Worklist()
     wl.sync(cards[1])
     assert wl.items()[0].created_at.endswith("+00:00")
+
+
+def test_wrong_visit_adt_leaves_items_alone(demo_source, incomplete_a04):
+    wl = Worklist(clock=fake_clock())
+    right = parse_adt(incomplete_a04)
+    wl.sync(build_card(gather(demo_source, "demo-wc-1002", "demo-enc-1002"), right))
+    before = {i.gap_code: i.status for i in wl.items()}
+    wrong = parse_adt(incomplete_a04.replace("FIN700200B", "FIN-OTHER"))
+    counts = wl.sync(build_card(gather(demo_source, "demo-wc-1002", "demo-enc-1002"), wrong))
+    assert counts["resolved"] == 0 and counts["opened"] == 1  # only ADT_VISIT_MISMATCH
+    after = {i.gap_code: i.status for i in wl.items()}
+    assert after == {**before, "ADT_VISIT_MISMATCH": "open"}
+    wl.sync(build_card(gather(demo_source, "demo-wc-1002", "demo-enc-1002"), right))
+    assert "ADT_VISIT_MISMATCH" not in {i.gap_code for i in wl.items()}  # resolved
+
+
+def test_dismiss_needs_a_note_in_the_same_update(cards):
+    _, bad = cards
+    wl = Worklist(clock=fake_clock())
+    wl.sync(bad)
+    item = wl.items()[0]
+    wl.update(item.id, status="in_progress", note="waiting on carrier")
+    with pytest.raises(ValueError, match="note"):
+        wl.update(item.id, status="dismissed")  # the old note is not a reason
+    assert wl.update(item.id, status="dismissed", note="not used at our site").status == (
+        "dismissed"
+    )
+
+
+def test_audit_log_is_append_only(cards):
+    _, bad = cards
+    wl = Worklist(clock=fake_clock())
+    wl.sync(bad)
+    for sql in ("UPDATE audit_log SET actor = 'someone else'", "DELETE FROM audit_log"):
+        with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+            wl.conn.execute(sql)
+
+
+def test_items_show_the_visit(cards):
+    _, bad = cards
+    wl = Worklist(clock=fake_clock())
+    wl.sync(bad)
+    assert {i.encounter_id for i in wl.items()} == {"demo-enc-1002"}
+    assert "demo-enc-1002" in render_worklist(wl.items())

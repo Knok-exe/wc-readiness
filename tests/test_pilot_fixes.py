@@ -163,6 +163,7 @@ def test_new1_no_worklist_on_legacy_db_reads_without_migrating(
     with Worklist(db) as wl:
         wl.sync(build_card(gather(FixtureSource(demo_data), P1, E1), parse_adt(complete_a04)))
         wl.conn.execute("DELETE FROM settings")
+        wl.conn.execute("DROP TRIGGER audit_log_no_delete")  # older DBs had none
         wl.conn.execute("DELETE FROM audit_log")
         wl.conn.commit()
     before = db.read_bytes()

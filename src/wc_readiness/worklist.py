@@ -1,7 +1,7 @@
 """The coordinator worklist, stored in SQLite.
 
-Oracle Health's FHIR API has no Task resource (Pip's RESEARCH.md section 0), so the app keeps
-its own to-do list. Each readiness gap that a person has to act on becomes a work item:
+Oracle Health's FHIR API has no Task resource (neither CapabilityStatement lists one), so the
+app keeps its own to-do list. Each readiness gap that a person has to act on becomes a work item:
 
     open -> in_progress -> done        (someone fixed it)
                         -> dismissed   (not applicable; a note is required)
@@ -25,7 +25,8 @@ Re-running the card for the same encounter "syncs" the list. The rules:
     its open WC items with that reason, flags in-progress ones instead of closing them, and
     leaves done/dismissed ones alone;
   * changes to an open item's severity or text are audited too.
-Every change is written to audit_log (who, what, when), which a real deployment needs.
+Every change is written to audit_log (who, what, when), which a real deployment needs. The log
+is append-only: SQLite triggers refuse UPDATE and DELETE on it.
 
 Site rule settings (WC financial classes, site time zone) are stored in the DB on first use,
 so a re-run that forgets --wc-class can't turn a WC visit into a non-WC one.
@@ -91,6 +92,10 @@ CREATE TABLE IF NOT EXISTS audit_log (
     actor       TEXT NOT NULL,
     at          TEXT NOT NULL
 );
+CREATE TRIGGER IF NOT EXISTS audit_log_no_update BEFORE UPDATE ON audit_log
+BEGIN SELECT RAISE(ABORT, 'audit_log is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS audit_log_no_delete BEFORE DELETE ON audit_log
+BEGIN SELECT RAISE(ABORT, 'audit_log is append-only'); END;
 """
 
 # Columns added after v0.1.0's first commit; added in place to older databases.
@@ -132,6 +137,7 @@ class WorkItem:
     id: int
     case_key: str
     patient_name: str
+    encounter_id: str
     gap_code: str
     severity: str
     message: str
@@ -600,7 +606,8 @@ class Worklist:
         row = self.conn.execute("SELECT * FROM work_items WHERE id = ?", (item_id,)).fetchone()
         if row is None:
             raise KeyError(f"no work item {item_id}")
-        if status == "dismissed" and not (note or row["note"]).strip():
+        if status == "dismissed" and row["status"] != "dismissed" and not (note or "").strip():
+            # A note left earlier ("waiting on carrier") isn't a reason for dismissing.
             raise ValueError("dismissing needs a --note saying why")
         changes = {
             k: v
@@ -646,7 +653,10 @@ class Worklist:
         item_id: int | None = None,
     ) -> list[WorkItem]:
         """Open/in-progress items, plus `done` items flagged still present (they need a look)."""
-        sql = "SELECT w.*, c.patient_name FROM work_items w JOIN cases c USING (case_key) WHERE 1=1"
+        sql = (
+            "SELECT w.*, c.patient_name, c.encounter_id FROM work_items w "
+            "JOIN cases c USING (case_key) WHERE 1=1"
+        )
         args: list = []
         if item_id is not None:
             sql += " AND w.id = ?"

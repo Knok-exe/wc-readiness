@@ -18,7 +18,9 @@ runs use the stored values, and changing them needs --reconfigure (audited).
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
+import os
 import sqlite3
 import sys
 from importlib import resources
@@ -50,6 +52,14 @@ def read_adt(path: str | None) -> AdtWcData | None:
     if not path:
         return None
     return parse_adt(Path(path).read_text(encoding="utf-8", errors="replace"))
+
+
+def default_actor() -> str:
+    """Who is running the command, for the audit log: the logged-in user name."""
+    try:
+        return getpass.getuser() or "coordinator"
+    except Exception:  # no user name available (some containers / services)
+        return "coordinator"
 
 
 def fhir_id(value: str) -> str:
@@ -187,7 +197,11 @@ def cmd_update(args) -> int:
     with Worklist(args.db, create=False) as wl:
         try:
             item = wl.update(
-                args.id, status=args.status, owner=args.owner, note=args.note, actor=args.actor
+                args.id,
+                status=args.status,
+                owner=args.owner,
+                note=args.note,
+                actor=args.actor or default_actor(),
             )
         except (KeyError, ValueError) as exc:
             print(f"error: {exc.args[0]}", file=sys.stderr)
@@ -284,7 +298,9 @@ def build_parser() -> argparse.ArgumentParser:
     u.add_argument("--status", choices=USER_STATUSES)
     u.add_argument("--owner")
     u.add_argument("--note", help="required when dismissing")
-    u.add_argument("--actor", default="coordinator", help="who is making the change (audit)")
+    u.add_argument(
+        "--actor", help="who is making the change, for the audit log (default: your user name)"
+    )
     u.set_defaults(func=cmd_update)
 
     au = sub.add_parser("audit", parents=[db], help="print the worklist audit log")
@@ -309,7 +325,15 @@ def main(argv: list[str] | None = None) -> int:
             print(f"error: unknown time zone {args.site_tz!r}", file=sys.stderr)
             return 1
     try:
-        return args.func(args)
+        code = args.func(args)
+        sys.stdout.flush()
+        return code
+    except BrokenPipeError:
+        # The reader went away (e.g. `wc-readiness --demo | head`): not an error worth printing.
+        # Point stdout at devnull so Python's own flush at exit doesn't complain either.
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, sys.stdout.fileno())
+        return 0
     except ParseError as exc:
         print(f"error: not a valid HL7 v2 message: {exc}", file=sys.stderr)
         return 1
