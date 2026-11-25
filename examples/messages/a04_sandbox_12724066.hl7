@@ -1,0 +1,8 @@
+MSH|^~\&|REGADT|EXAMPLEHOSP|WCREADY|EXAMPLEHOSP|20261124090000||ADT^A04^ADT_A01|WCLIVE0001|P|2.5.1
+EVN|A04|20261124090000
+PID|1||6000031^^^EXAMPLEHOSP^MR||SANDBOX^TESTPATIENT
+PV1|1|E|ED^BAY4^^EXAMPLEHOSP||||||||||||||||16137|WC||||||||||||||||||||||||20261124090000
+IN1|1|WC001^Workers Comp|SYNWC01|Synthetic State Fund WC|||||||||||WC|||||||||||||||||||||WC-SYN-000777
+IN2|||EMP0099^Contoso Example Hospital Supply
+GT1|1||SANDBOX^TESTPATIENT||||||||||||||||||||||||||||||||||||||||||||||||Contoso Example Hospital Supply
+ACC|20261123|WPA^Workplace accident^L|||Y|||Synthetic: lifting strain while stocking shelves

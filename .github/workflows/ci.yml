@@ -1,0 +1,24 @@
+name: ci
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+      - run: uv venv --python ${{ matrix.python-version }} && uv pip install -e ".[dev]"
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv run pytest -q
+      - name: Offline demo runs
+        run: uv run wc-readiness --demo
+      - name: Wheel ships the demo data
+        run: |
+          uv build --wheel
+          python -c "import glob, zipfile; n = zipfile.ZipFile(glob.glob('dist/*.whl')[0]).namelist(); missing = [f for f in ('demo_fhir.json', 'a04_wc_complete.hl7', 'a04_wc_incomplete.hl7') if not any(x.endswith(f) for x in n)]; assert not missing, missing"

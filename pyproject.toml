@@ -1,0 +1,38 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "wc-readiness"
+version = "0.1.0"
+description = "Phase 0 workers' comp readiness card: Oracle Health open FHIR R4 sandbox + synthetic HL7 v2 A04, with a SQLite coordinator worklist. Synthetic data only."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Knok-exe" }]
+dependencies = ["requests>=2.31"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.6"]
+
+[project.scripts]
+wc-readiness = "wc_readiness.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/wc_readiness"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+markers = ["live: hits the public Oracle Health open sandbox (skipped unless WC_LIVE=1)"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "PERF", "DTZ"]
+
+[tool.ruff.lint.per-file-ignores]
+# Vendored verbatim from hl7v2-to-fhir; keep it identical to upstream so it is easy to diff.
+"src/wc_readiness/hl7v2.py" = ["SIM108"]
