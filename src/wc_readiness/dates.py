@@ -21,6 +21,15 @@ def site_tz(name: str = DEFAULT_SITE_TZ) -> tzinfo:
     return ZoneInfo(name)
 
 
+_FRACTION = re.compile(r"(T\d{2}:\d{2}:\d{2})\.(\d+)")
+
+
+def _six_digit_fraction(text: str) -> str:
+    """FHIR allows any number of fraction digits; Python 3.10's fromisoformat only takes 3 or 6.
+    Pad or cut to 6 (sub-microsecond digits can't change the date)."""
+    return _FRACTION.sub(lambda m: f"{m[1]}.{m[2][:6].ljust(6, '0')}", text, count=1)
+
+
 def fhir_local_date(value: str, tz: tzinfo | None = None) -> str:
     """ISO date (YYYY-MM-DD) of a FHIR date/dateTime in the site time zone, or '' if unusable."""
     text = (value or "").strip()
@@ -29,7 +38,7 @@ def fhir_local_date(value: str, tz: tzinfo | None = None) -> str:
     try:
         if len(text) == 10:
             return date.fromisoformat(text).isoformat()
-        moment = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        moment = datetime.fromisoformat(_six_digit_fraction(text.replace("Z", "+00:00")))
     except ValueError:
         return ""
     if moment.tzinfo is not None:

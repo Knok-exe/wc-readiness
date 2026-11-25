@@ -157,13 +157,19 @@ nowhere in the EHR to keep "chase claim # for this visit". The app keeps its own
 - re-checking a visit **syncs** the list, with these rules:
   - a gap that was checked and is gone closes its open item as `resolved` (only the system sets
     `resolved`);
-  - a gap that **couldn't be checked** this time (a FHIR read failed, or the ADT is for someone
-    else) leaves its item exactly as it was. A timeout never closes anything;
-  - the coordinator's decisions stick. A `dismissed` item stays dismissed while the gap says the
-    same thing. A `done` item whose gap is still there gets a **still_present** flag (and stays on
-    the list) instead of quietly reopening;
-  - a closed item reopens only if something really changed: the gap's text changed, or the gap
-    went away and came back;
+  - a gap that **couldn't be checked** this time (a FHIR read failed, the ADT is for someone
+    else, or there was no `--adt` at all) leaves its item exactly as it was. A timeout or a
+    forgotten `--adt` never closes anything;
+  - the coordinator's decisions stick. A `dismissed` item stays dismissed while the gap is about
+    the same data (each gap carries a *key*: the rule plus the values/sources it's about, not its
+    wording, so a reworded message in a new version doesn't reopen anything). A `done` item whose
+    gap is still there gets a **still_present** flag (and stays on the list) instead of quietly
+    reopening; setting it to `done` again clears the flag;
+  - a closed item reopens only if something really changed: the gap's data changed, or the gap
+    went away and came back. Databases from older versions are upgraded in place, and items
+    already closed there adopt their current key without reopening;
+  - a visit that is positively **not WC** closes open WC items and flags in-progress ones (see
+    "Is this even a WC visit?" below);
   - nothing is duplicated, and severity/text changes on open items are recorded too;
 - every change goes into an **audit_log** table (who, what, when in UTC).
 
@@ -201,10 +207,19 @@ flowchart LR
 The WC checks only run when there's a real WC signal: a WC financial class in PV1-20, a WC
 Coverage (type 95...), an IN1 whose plan is marked WC (IN1-2/IN1-15), or ACC-5 = Y. Otherwise:
 
-- no signal at all (or ACC-5 = N with nothing else) gives **NOT A WC VISIT** (`NOT_WC_VISIT`, info),
-  and any WC items already on the worklist for that visit are closed as resolved;
+- **NOT A WC VISIT** (`NOT_WC_VISIT`, info) needs *positive* evidence: an ADT that matches this
+  patient and has a non-WC financial class in PV1-20 (ACC-5 = N backs it up). The WC items already
+  on the worklist for that visit are then handled like this, each with a "not a WC visit" audit entry:
+  - `open` items are closed as resolved;
+  - `in_progress` items are **left open** with a `not_wc_visit` flag, because someone is already
+    working them and a registration slip (wrong financial class) shouldn't silently end that
+    work; the flag clears by itself if a later run sees a WC visit again;
+  - `done` and `dismissed` items are left exactly as they are.
 - an injury diagnosis or an ACC segment but no WC signal gives **WC STATUS UNCLEAR**
   (`WC_STATUS_UNCLEAR`, medium): someone should ask whether it happened at work.
+- **no ADT** (you left out `--adt`), or an ADT for a different patient, is *not* evidence of
+  anything. The card says **UNKNOWN** (or WC STATUS UNCLEAR if FHIR shows an injury) and the
+  worklist leaves every WC item, and every ADT-sourced item, exactly as it was.
 
 ### Where each essential value comes from
 
@@ -245,7 +260,7 @@ a one-day conflict.
 | `INJURY_DATE_CONFLICT` | medium | sources disagree on the (local) injury date |
 | `INJURY_DX_MISSING` | medium | no ICD-10-CM injury code (S, T, V-Y) linked to the encounter |
 | `OCCUPATION_MISSING` | low | no occupation in social history |
-| `NOT_WC_VISIT`, `NO_ADT`, `ADT_WARNING`, `WORK_STATUS_NOTE_MISSING`, `FHIR_READ_FAILED:*` | info | context; not put on the worklist |
+| `NOT_WC_VISIT`, `WC_STATUS_UNKNOWN`, `NO_ADT`, `ADT_WARNING`, `WORK_STATUS_NOTE_MISSING`, `FHIR_READ_FAILED:*` | info | context; not put on the worklist |
 
 **READY** = a WC visit with no high gaps and every FHIR read working. If a read failed (the sandbox
 sometimes times out), the card says **UNKNOWN**, because "couldn't check" is not the same as

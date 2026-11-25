@@ -93,6 +93,10 @@ class Gap:
     severity: str  # high | medium | low | info
     message: str
     fix_hint: str = ""
+    # The data the gap is about (values, sources), without the wording. The worklist compares
+    # this, not `message`, to decide whether a dismissed item's gap "really changed", so a
+    # rewording in a later release doesn't reopen everything. "" = nothing beyond the code.
+    key: str = ""
 
 
 @dataclass
@@ -140,6 +144,8 @@ class ReadinessCard:
             return f"UNKNOWN ({len(self.fhir.errors)} FHIR read(s) failed; re-run)"
         if self.wc_status == "unclear":
             return "WC STATUS UNCLEAR"
+        if self.wc_status == "unknown":
+            return "UNKNOWN (no usable ADT and no WC signal in FHIR: can't tell if this is WC)"
         return "READY"
 
     def to_dict(self) -> dict:
@@ -261,7 +267,7 @@ def build_card(
         adt_matched=matched,
         site_tz=str(tz),
     )
-    card.wc_status = _wc_status(card, strong=bool(signals))
+    card.wc_status = _wc_status(card, strong=bool(signals), wc_classes=wc_financial_classes)
     if injury_dx:
         card.wc_signals.append(f"injury diagnosis ({injury_dx[0].text}) [weak]")
     card.gaps, card.unchecked = find_gaps(
@@ -270,20 +276,30 @@ def build_card(
     return card
 
 
-def _wc_status(card: ReadinessCard, *, strong: bool) -> str:
-    """Is this a workers' comp visit at all?"""
-    adt = card.adt if card.adt_matched else None
+def _wc_status(card: ReadinessCard, *, strong: bool, wc_classes) -> str:
+    """Is this a workers' comp visit at all?
+
+    Only positive evidence makes a visit "not WC": an ADT that matches this patient and carries
+    a financial class (PV1-20) that isn't a WC class. A missing or mismatched ADT is NOT
+    evidence (forgetting --adt must never close the coordinator's items), so it gives
+    "unclear" (injury/accident seen) or "unknown".
+    """
     if strong:
         return "wc"
-    adt_unusable = card.adt is not None and not card.adt_matched
-    if card.fhir.errors or adt_unusable:
+    if card.fhir.errors:
         return "unknown"
-    if adt is not None and adt.job_related == "N":
-        return "not_wc"
+    adt = card.adt if card.adt_matched else None
     weak = bool(card.fhir.injury_conditions) or (
         adt is not None and bool(adt.injury_date_raw or adt.accident_code)
     )
-    return "unclear" if weak else "not_wc"
+    fc = adt.financial_class.strip() if adt is not None else ""
+    if adt is not None and fc and not is_wc_financial_class(fc, wc_classes):
+        if adt.job_related == "N" or not weak:
+            return "not_wc"
+        return "unclear"
+    if card.adt is not None and not card.adt_matched:
+        return "unknown"  # the ADT is someone else's: we know nothing about this visit's class
+    return "unclear" if weak else "unknown"
 
 
 def find_gaps(
@@ -333,6 +349,7 @@ def find_gaps(
                 f"The ADT message does not match this FHIR patient ({card.patient_match}). Its "
                 "WC fields were NOT used, and ADT-based items were left as they were.",
                 "Check you picked the right message / patient.",
+                key=f"adt_mrn={adt.mrn}",
             )
         )
         unchecked.add("ADT_DEMOGRAPHICS_DIFFER")
@@ -345,6 +362,7 @@ def find_gaps(
                 f"{adt.birth_date or '?'} vs FHIR {fhir.patient_name or '?'} "
                 f"{fhir.birth_date or '?'}.",
                 "Confirm identity; one of the systems may hold an old name or a typo.",
+                key=f"{adt.patient_name}|{adt.birth_date}|{fhir.patient_name}|{fhir.birth_date}",
             )
         )
     if adt_usable:
@@ -357,9 +375,11 @@ def find_gaps(
             Gap(
                 "NOT_WC_VISIT",
                 "info",
-                "No workers' comp signal (no WC financial class, no WC coverage, no job-related "
-                "accident), so the WC checks don't apply.",
+                f"Registered as a non-WC visit (PV1-20={adt.financial_class.strip()}"
+                + (", ACC-5=N" if adt.job_related == "N" else "")
+                + ") and no WC coverage or WC-marked IN1, so the WC checks don't apply.",
                 "If this IS a work injury, registration needs to set the WC financial class/plan.",
+                key=f"fc={adt.financial_class.strip()}",
             )
         )
         _finish(gaps)
@@ -372,11 +392,22 @@ def find_gaps(
                 "There's an injury or accident but no WC financial class, WC coverage or "
                 "job-related flag. Is this a work injury?",
                 "Ask the patient whether the injury happened at work; update registration.",
+                key=f"fc={adt.financial_class.strip() if adt_usable else ''}",
             )
         )
     if card.wc_status != "wc":
         if card.wc_status == "unknown":
             unchecked.add("WC_STATUS_UNCLEAR")
+            if adt is None:
+                add(
+                    Gap(
+                        "WC_STATUS_UNKNOWN",
+                        "info",
+                        "No ADT supplied and FHIR shows no WC coverage or injury: can't tell "
+                        "whether this is a WC visit. WC items were left as they were.",
+                        "Re-run with --adt.",
+                    )
+                )
         unchecked |= WC_RULE_CODES
         _finish(gaps)
         return gaps, unchecked
@@ -394,7 +425,8 @@ def find_gaps(
         else:
             msg = "No Coverage typed as workers' comp (SOP 95/951/953/954/959 or ActCode WCBPOL)."
             hint = "Register the WC carrier as a health plan on the encounter."
-        add(Gap("WC_COVERAGE_MISSING", "high", msg, hint))
+        fc = adt.financial_class.strip() if adt_usable else ""
+        add(Gap("WC_COVERAGE_MISSING", "high", msg, hint, key=f"fc={fc}" if fc_is_wc else ""))
 
     for key, prefix in ESSENTIALS.items():
         value = ess.get(key)
@@ -416,8 +448,16 @@ def find_gaps(
                     f"{key.replace('_', ' ').capitalize()} '{value.value}' comes from "
                     f"{value.source}, which may not be the WC value.",
                     "Confirm it with the patient, employer or carrier.",
+                    key=f"{value.value}|{value.source}",
                 )
             )
+
+    if adt is None:
+        # Without the ADT, an essential that isn't found is still reported, but an earlier
+        # ADT-based gap can't be confirmed as fixed: don't let a forgotten --adt close items.
+        for prefix in ESSENTIALS.values():
+            unchecked |= {f"{prefix}_MISSING", f"{prefix}_UNCONFIRMED"}
+        unchecked.add("INJURY_DATE_CONFLICT")
 
     if adt_usable:
         if adt.job_related == "N":
@@ -428,6 +468,7 @@ def find_gaps(
                     "ACC-5 says the accident is NOT job related, but the visit is registered as "
                     "WC. Billing WC for a non-work injury gets denied.",
                     "Confirm with the patient/employer; fix ACC-5 or the financial class.",
+                    key="acc5=N",
                 )
             )
         elif adt.job_related != "Y":
@@ -437,6 +478,7 @@ def find_gaps(
                     "medium",
                     "ACC-5 (accident job related) is not set to Y.",
                     "Set the job-related indicator in registration.",
+                    key=f"acc5={adt.job_related}",
                 )
             )
     else:
@@ -464,6 +506,7 @@ def find_gaps(
                 "Injury date differs between sources: "
                 + "; ".join(f"{s.value} ({s.source})" for s in candidates),
                 "Confirm the date of injury with the patient and fix the wrong source.",
+                key=";".join(sorted(f"{s.value}|{s.source}" for s in candidates)),
             )
         )
     elif {"Condition", "Encounter"} & failed or (adt is not None and not adt_usable):

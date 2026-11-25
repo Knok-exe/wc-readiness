@@ -148,7 +148,7 @@ def test_3_dismissed_reopens_when_the_gap_changes(casey, demo_source, incomplete
     changed = build_card(gather(demo_source, "demo-wc-1002", "demo-enc-1002"), adt)
     assert wl.sync(changed)["reopened"] == 1
     assert wl.get(item.id).status == "open"
-    assert "gap changed" in wl.audit()[-1]["detail"]
+    assert "gap data changed" in wl.audit()[-1]["detail"]
 
 
 def test_3_done_reopens_when_gap_went_away_and_came_back(casey, demo_source, incomplete_a04):
@@ -270,7 +270,7 @@ def test_6_reopen_refreshes_fix_hint(casey):
     changed = dataclasses.replace(casey, gaps=[dataclasses.replace(g) for g in casey.gaps])
     for g in changed.gaps:
         if g.code == "OCCUPATION_MISSING":
-            g.message, g.fix_hint = "different text", "fresh hint"
+            g.message, g.fix_hint, g.key = "different text", "fresh hint", "new data"
     wl.sync(changed)
     assert wl.get(item.id).fix_hint == "fresh hint"
 

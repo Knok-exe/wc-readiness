@@ -12,11 +12,15 @@ Re-running the card for the same encounter "syncs" the list. The rules:
   * a gap that was checked and is gone closes its open item as `resolved`;
   * a gap that could NOT be checked this run (a FHIR read failed, the ADT was for someone else)
     leaves its item exactly as it was: a timeout must never close anything;
-  * the coordinator's decisions stick: a `dismissed` item stays dismissed while the gap says the
-    same thing, and a `done` item whose gap is still there gets a "still present" flag instead
-    of silently reopening;
-  * a closed item only reopens when something really changed: the gap's text changed since it
+  * the coordinator's decisions stick: a `dismissed` item stays dismissed while the gap's data
+    (Gap.key: the values and sources it is about, not its wording) is the same, and a `done`
+    item whose gap is still there gets a "still present" flag instead of silently reopening
+    (setting it to done again clears the flag);
+  * a closed item only reopens when something really changed: the gap's data changed since it
     was closed, or the gap went away and later came back;
+  * a visit that is positively NOT workers' comp (matched ADT, non-WC financial class) closes
+    its open WC items with that reason, flags in-progress ones instead of closing them, and
+    leaves done/dismissed ones alone;
   * changes to an open item's severity or text are audited too.
 Every change is written to audit_log (who, what, when), which a real deployment needs.
 
@@ -31,7 +35,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .card import ReadinessCard
+from .card import WC_RULE_CODES, ReadinessCard
 
 STATUSES = ("open", "in_progress", "done", "dismissed", "resolved")
 USER_STATUSES = ("open", "in_progress", "done", "dismissed")  # `resolved` is system-only
@@ -39,6 +43,7 @@ ACTIVE = {"open", "in_progress"}
 CLOSED = {"done", "dismissed", "resolved"}
 WORKLIST_SEVERITIES = {"high", "medium", "low"}
 STILL_PRESENT = "still_present"
+NOT_WC_FLAG = "not_wc_visit"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS cases (
@@ -78,8 +83,12 @@ CREATE TABLE IF NOT EXISTS audit_log (
 # Columns added after v0.1.0's first commit; added in place to older databases.
 MIGRATIONS = {
     "present": "INTEGER NOT NULL DEFAULT 1",  # was the gap there on the last checked run?
-    "closed_message": "TEXT NOT NULL DEFAULT ''",  # gap text when a person closed the item
-    "flag": "TEXT NOT NULL DEFAULT ''",  # e.g. still_present
+    "closed_message": "TEXT NOT NULL DEFAULT ''",  # unused since gap keys; kept for old DBs
+    "flag": "TEXT NOT NULL DEFAULT ''",  # still_present | not_wc_visit
+    # The gap's data key (Gap.key) on the latest run, and what it was when a person closed the
+    # item. NULL closed_key = closed before keys existed: adopt the current key, don't reopen.
+    "gap_key": "TEXT",
+    "closed_key": "TEXT",
 }
 
 
@@ -113,11 +122,6 @@ class Worklist:
         for column, ddl in MIGRATIONS.items():
             if column not in have:
                 self.conn.execute(f"ALTER TABLE work_items ADD COLUMN {column} {ddl}")
-                if column == "closed_message":  # keep old closed items closed after upgrade
-                    self.conn.execute(
-                        "UPDATE work_items SET closed_message = message "
-                        "WHERE status IN ('done', 'dismissed')"
-                    )
         self.conn.commit()
         self._now = clock
 
@@ -171,8 +175,9 @@ class Worklist:
                 if row is None:
                     cur = self.conn.execute(
                         "INSERT INTO work_items (case_key, gap_code, severity, message, fix_hint,"
-                        " status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'open', ?, ?)",
-                        (key, code, gap.severity, gap.message, gap.fix_hint, now, now),
+                        " gap_key, status, created_at, updated_at)"
+                        " VALUES (?, ?, ?, ?, ?, ?, 'open', ?, ?)",
+                        (key, code, gap.severity, gap.message, gap.fix_hint, gap.key, now, now),
                     )
                     self._audit(cur.lastrowid, key, "opened", code, actor)
                     counts["opened"] += 1
@@ -183,6 +188,9 @@ class Worklist:
                     continue
                 if code in card.unchecked:
                     counts["unchecked"] += 1  # couldn't check: leave it exactly as it is
+                    continue
+                if card.wc_status == "not_wc" and code in WC_RULE_CODES:
+                    self._close_not_wc(row, card, key, now, actor, counts)
                     continue
                 if row["present"]:
                     self._set(row["id"], present=0)
@@ -195,10 +203,36 @@ class Worklist:
                     self._audit(row["id"], key, "confirmed", "gap now gone after done", actor)
         return counts
 
+    def _close_not_wc(self, row, card, key, now, actor, counts) -> None:
+        """The visit is positively not WC (a matched ADT with a non-WC financial class).
+        * open items are closed as resolved, with their own audit reason;
+        * in_progress items are NOT closed: someone is working them, so they get a
+          not_wc_visit flag and stay on the list for that person to decide;
+        * done/dismissed items are left alone (and not marked "gone"), so a later flip back
+          to WC doesn't reopen them just because of this run."""
+        reason = next((g.message for g in card.gaps if g.code == "NOT_WC_VISIT"), "not a WC visit")
+        if row["status"] == "open":
+            self._set(row["id"], status="resolved", present=0, flag="", updated_at=now)
+            self._audit(row["id"], key, "resolved", f"not a WC visit: {reason}", actor)
+            counts["resolved"] += 1
+        elif row["status"] == "in_progress" and row["flag"] != NOT_WC_FLAG:
+            self._set(row["id"], flag=NOT_WC_FLAG, updated_at=now)
+            self._audit(
+                row["id"], key, "flagged", f"left in progress, but not a WC visit: {reason}", actor
+            )
+            counts["flagged"] += 1
+        else:
+            counts["kept_closed"] += 1
+
     def _sync_present(self, row, gap, key, now, actor, counts) -> None:
         status = row["status"]
         changed = gap.message != row["message"] or gap.severity != row["severity"]
+        if row["gap_key"] != gap.key:
+            self._set(row["id"], gap_key=gap.key)
         if status in ACTIVE:
+            if row["flag"] == NOT_WC_FLAG:  # it's a WC visit again
+                self._set(row["id"], flag="", updated_at=now)
+                self._audit(row["id"], key, "unflagged", "WC visit again", actor)
             if changed:
                 self._set(
                     row["id"],
@@ -217,12 +251,17 @@ class Worklist:
             return
 
         came_back = not row["present"]
-        text_changed = status != "resolved" and gap.message != row["closed_message"]
-        if status == "resolved" or came_back or text_changed:
+        if status != "resolved" and row["closed_key"] is None:
+            # Closed before gap keys existed (or by an older version): adopt, don't reopen.
+            self._set(row["id"], closed_key=gap.key)
+            data_changed = False
+        else:
+            data_changed = status != "resolved" and gap.key != row["closed_key"]
+        if status == "resolved" or came_back or data_changed:
             why = (
                 "gap came back"
                 if status == "resolved" or came_back
-                else "gap changed since it was closed"
+                else f"gap data changed since it was closed ({row['closed_key']!r} -> {gap.key!r})"
             )
             self._set(
                 row["id"],
@@ -232,7 +271,7 @@ class Worklist:
                 fix_hint=gap.fix_hint,
                 present=1,
                 flag="",
-                closed_message="",
+                closed_key=None,
                 updated_at=now,
             )
             detail = f"was {status}; {why}"
@@ -273,15 +312,19 @@ class Worklist:
             for k, v in (("status", status), ("owner", owner), ("note", note))
             if v is not None and v != row[k]
         }
-        if changes:
+        clear_flag = status is not None and status == row["status"] and row["flag"]
+        if changes or clear_flag:
             extra: dict = {"updated_at": self._now()}
-            if "status" in changes:
+            if "status" in changes or clear_flag:
                 extra["flag"] = ""
-                # Remember what the gap said when a person closed it, so a later change reopens.
-                extra["closed_message"] = row["message"] if status in CLOSED else ""
+            if "status" in changes:
+                # Remember the gap's data when a person closes it, so a real change reopens it.
+                extra["closed_key"] = row["gap_key"] if status in CLOSED else None
             with self.conn:
                 self._set(item_id, **changes, **extra)
                 detail = "; ".join(f"{k}: {row[k]!r} -> {v!r}" for k, v in changes.items())
+                if clear_flag and "status" not in changes:
+                    detail = "; ".join(p for p in (detail, f"flag {row['flag']!r} cleared") if p)
                 self._audit(item_id, row["case_key"], "updated", detail, actor)
         return self.get(item_id)
 
