@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import textwrap
 
 from .card import ReadinessCard
@@ -16,6 +17,14 @@ LABELS = {
 }
 MARK = {"high": "!!", "medium": "! ", "low": "- ", "info": "i "}
 WIDTH = 92
+# C0 controls except newline, DEL and C1 controls. A name or ACC-8 text from FHIR/HL7 carrying
+# an ANSI/OSC escape sequence could otherwise rewrite the coordinator's terminal.
+_CONTROL = re.compile(r"[\x00-\x09\x0b-\x1f\x7f-\x9f]")
+
+
+def clean(text: str) -> str:
+    """Make untrusted text safe to print: control characters become '?'."""
+    return _CONTROL.sub("?", text)
 
 
 def _wrap(text: str, indent: str) -> list[str]:
@@ -99,11 +108,12 @@ def render_card(card: ReadinessCard) -> str:
     if not card.gaps:
         lines.append("  none")
     for g in card.gaps:
-        lines += _wrap(f"{MARK[g.severity]} [{g.severity}] {g.code}: {g.message}", "  ")
+        tag = " (provisional: no matched ADT)" if g.provisional else ""
+        lines += _wrap(f"{MARK[g.severity]} [{g.severity}] {g.code}{tag}: {g.message}", "  ")
         if g.fix_hint:
             lines += _wrap(f"-> {g.fix_hint}", "       ")
     lines.append(rule)
-    return "\n".join(lines)
+    return clean("\n".join(lines))
 
 
 def render_worklist(items: list[WorkItem]) -> str:
@@ -117,4 +127,4 @@ def render_worklist(items: list[WorkItem]) -> str:
         f"{it.gap_code[:26]:<26} {(it.owner or '-')[:12]:<12} {it.flag}".rstrip()
         for it in items
     )
-    return "\n".join(lines)
+    return clean("\n".join(lines))

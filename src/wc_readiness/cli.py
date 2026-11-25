@@ -8,13 +8,18 @@
     wc-readiness update 3 --status in_progress --owner "Knok"
     wc-readiness audit
 
-Exit codes for `card`: 0 READY, 2 not ready / unknown / unclear, 3 not a WC visit, 1 error.
+Exit codes for `card`: 0 READY, 2 not ready / unknown / unclear, 3 not a WC visit, 1 error
+(including an Encounter that belongs to another patient: nothing is written then).
+
+--wc-class and --site-tz are site settings: the first run stores them in the worklist DB, later
+runs use the stored values, and changing them needs --reconfigure (audited).
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import sqlite3
 import sys
 from importlib import resources
 from pathlib import Path
@@ -24,10 +29,10 @@ from . import __version__
 from .adt import DEFAULT_WC_FINANCIAL_CLASSES, AdtWcData, ParseError, parse_adt
 from .card import ReadinessCard, build_card
 from .dates import DEFAULT_SITE_TZ, site_tz
-from .fhir_client import ORACLE_OPEN_SANDBOX, FhirClient, FhirSource, FixtureSource
-from .fhir_facts import gather
-from .render import render_card, render_worklist
-from .worklist import USER_STATUSES, Worklist
+from .fhir_client import ORACLE_OPEN_SANDBOX, FhirClient, FhirSource, FixtureSource, check_id
+from .fhir_facts import ContextMismatch, gather
+from .render import clean, render_card, render_worklist
+from .worklist import USER_STATUSES, SettingsConflict, Worklist
 
 DEFAULT_DB = "wc_worklist.db"
 
@@ -45,6 +50,28 @@ def read_adt(path: str | None) -> AdtWcData | None:
     if not path:
         return None
     return parse_adt(Path(path).read_text(encoding="utf-8", errors="replace"))
+
+
+def fhir_id(value: str) -> str:
+    """argparse type: a FHIR id (letters, digits, '-', '.'), so it can't change the URL."""
+    try:
+        return check_id(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from None
+
+
+def apply_settings(args, wl: Worklist | None) -> None:
+    """Work out the WC classes and site time zone for this run: explicit flags, else what the
+    worklist DB stored on its first run, else the defaults (which the first run stores)."""
+    explicit = {k for k, v in (("wc_classes", args.wc_classes), ("site_tz", args.site_tz)) if v}
+    values = {
+        "wc_classes": json.dumps(sorted(args.wc_classes or DEFAULT_WC_FINANCIAL_CLASSES)),
+        "site_tz": args.site_tz or DEFAULT_SITE_TZ,
+    }
+    if wl is not None:
+        values = wl.configure(values, explicit, reconfigure=args.reconfigure)
+    args.wc_classes = frozenset(json.loads(values["wc_classes"]))
+    args.tz = site_tz(values["site_tz"])
 
 
 def make_card(source: FhirSource, patient: str, encounter: str | None, adt, args) -> ReadinessCard:
@@ -70,6 +97,7 @@ def cmd_demo(args) -> int:
     """The demo uses an in-memory worklist unless --db is given, so it never leaves files."""
     source, cases = load_demo()
     with Worklist(args.db or ":memory:") as wl:
+        apply_settings(args, wl)
         cards = []
         for case in cases:
             card = make_card(
@@ -87,12 +115,21 @@ def cmd_demo(args) -> int:
 def cmd_card(args) -> int:
     adt = read_adt(args.adt)
     source = FhirClient(args.server, timeout=args.timeout)
-    card = make_card(source, args.patient, args.encounter, adt, args)
     if args.no_worklist:
+        apply_settings(args, None)
+        card = make_card(source, args.patient, args.encounter, adt, args)
         emit([card], None, args.format)
     else:
         with Worklist(args.db) as wl:
+            apply_settings(args, wl)
+            try:
+                card = make_card(source, args.patient, args.encounter, adt, args)
+            except ContextMismatch as exc:
+                wl.conn.rollback()  # not even the settings: nothing from this run is kept
+                print(f"error: {exc}. Nothing was written to the worklist.", file=sys.stderr)
+                return 1
             counts = wl.sync(card)
+            wl.conn.commit()
             if args.format == "text":
                 if counts["skipped"]:
                     print("Worklist NOT updated: no encounter could be identified for this card.")
@@ -111,7 +148,7 @@ def cmd_adt(args) -> int:
 
 
 def cmd_worklist(args) -> int:
-    with Worklist(args.db) as wl:
+    with Worklist(args.db, create=False) as wl:
         items = wl.items(include_closed=args.all, status=args.status)
         if args.format == "json":
             print(json.dumps([vars(i) for i in items], indent=2))
@@ -121,7 +158,7 @@ def cmd_worklist(args) -> int:
 
 
 def cmd_update(args) -> int:
-    with Worklist(args.db) as wl:
+    with Worklist(args.db, create=False) as wl:
         try:
             item = wl.update(
                 args.id, status=args.status, owner=args.owner, note=args.note, actor=args.actor
@@ -134,11 +171,13 @@ def cmd_update(args) -> int:
 
 
 def cmd_audit(args) -> int:
-    with Worklist(args.db) as wl:
+    with Worklist(args.db, create=False) as wl:
         for row in wl.audit():
             print(
-                f"{row['at']}  item {row['item_id']!s:>3}  {row['action']:<9} {row['actor']:<12} "
-                f"{row['detail']}"
+                clean(
+                    f"{row['at']}  item {row['item_id']!s:>3}  {row['action']:<9} "
+                    f"{row['actor']:<12} {row['detail']}"
+                )
             )
     return 0
 
@@ -168,8 +207,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     rules.add_argument(
         "--site-tz",
-        default=DEFAULT_SITE_TZ,
+        default=None,
         help=f"time zone used to turn timestamps into dates (default {DEFAULT_SITE_TZ})",
+    )
+    rules.add_argument(
+        "--reconfigure",
+        action="store_true",
+        help="allow --wc-class / --site-tz to change the values stored in this worklist (audited)",
     )
     sub = p.add_subparsers(dest="command")
 
@@ -178,8 +222,10 @@ def build_parser() -> argparse.ArgumentParser:
     d.set_defaults(func=cmd_demo)
 
     c = sub.add_parser("card", parents=[db, fmt, rules], help="build a card from a FHIR server")
-    c.add_argument("--patient", required=True, help="FHIR Patient id")
-    c.add_argument("--encounter", help="FHIR Encounter id (default: latest for the patient)")
+    c.add_argument("--patient", required=True, type=fhir_id, help="FHIR Patient id")
+    c.add_argument(
+        "--encounter", type=fhir_id, help="FHIR Encounter id (default: latest for the patient)"
+    )
     c.add_argument("--adt", help="HL7 v2 ADT file to merge (synthetic!)")
     c.add_argument("--server", default=ORACLE_OPEN_SANDBOX, help="FHIR R4 base URL")
     c.add_argument("--timeout", type=float, default=60.0, help="seconds per request")
@@ -218,14 +264,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.command is None:
         parser.print_help()
         return 1
-    args.wc_classes = (
-        frozenset(args.wc_classes)
-        if getattr(args, "wc_classes", None)
-        else DEFAULT_WC_FINANCIAL_CLASSES
-    )
-    if hasattr(args, "site_tz"):
+    if getattr(args, "site_tz", None):
         try:
-            args.tz = site_tz(args.site_tz)
+            site_tz(args.site_tz)
         except (ZoneInfoNotFoundError, ValueError):
             print(f"error: unknown time zone {args.site_tz!r}", file=sys.stderr)
             return 1
@@ -233,6 +274,12 @@ def main(argv: list[str] | None = None) -> int:
         return args.func(args)
     except ParseError as exc:
         print(f"error: not a valid HL7 v2 message: {exc}", file=sys.stderr)
+        return 1
+    except SettingsConflict as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    except sqlite3.Error as exc:
+        print(f"error: cannot open worklist DB {getattr(args, 'db', '')}: {exc}", file=sys.stderr)
         return 1
     except OSError as exc:
         print(f"error: {exc}", file=sys.stderr)

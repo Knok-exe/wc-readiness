@@ -52,15 +52,23 @@ def test_search_follows_next_links():
 
 
 def test_next_link_to_another_host_is_not_followed():
+    """Not followed, and not silently partial either: the search counts as failed."""
     c, s = client([bundle(["a"], "http://evil.example/Coverage?page=2")])
-    assert [r["id"] for r in c.search("Coverage", {})] == ["a"]
+    with pytest.raises(FhirError, match="leaves the server"):
+        c.search("Coverage", {})
     assert len(s.calls) == 1
 
 
 def test_max_pages_limits_paging():
     c, s = client([bundle(["a"], "http://x/r4/n1"), bundle(["b"], "http://x/r4/n2")], max_pages=2)
-    assert len(c.search("Coverage", {})) == 2
+    with pytest.raises(FhirError, match="truncated after 2 pages"):
+        c.search("Coverage", {})
     assert len(s.calls) == 2
+
+
+def test_paging_within_max_pages_returns_everything():
+    c, s = client([bundle(["a"], "http://x/r4/n1"), bundle(["b"])], max_pages=2)
+    assert [r["id"] for r in c.search("Coverage", {})] == ["a", "b"]
 
 
 def test_other_resource_types_in_bundle_are_dropped():

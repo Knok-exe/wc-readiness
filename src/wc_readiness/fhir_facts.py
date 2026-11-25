@@ -13,6 +13,11 @@ from datetime import tzinfo
 from .dates import fhir_local_date
 from .fhir_client import FhirError, FhirSource
 
+
+class ContextMismatch(FhirError):
+    """The Encounter asked for belongs to a different patient. Nothing from it may be used."""
+
+
 # Source of Payment Typology (PHDSC/NAHDO). 95 = Worker's Compensation; 951/953/954/959 are
 # its children (there is no 952). Oracle sends the OID form of the system.
 SOP_SYSTEMS = {"urn:oid:2.16.840.1.113883.3.221.5", "https://nahdo.org/sopt"}
@@ -51,6 +56,18 @@ class CoverageFact:
     member_id: str
     status: str
     encounter_level: bool
+    period_start: str = ""  # local dates ('' = open-ended or unknown)
+    period_end: str = ""
+
+    def current_on(self, day: str) -> bool:
+        """Active, and (if we know the visit date) the period includes it."""
+        if self.status != "active":
+            return False
+        if not day:
+            return True
+        return (not self.period_start or self.period_start <= day) and (
+            not self.period_end or day <= self.period_end
+        )
 
 
 @dataclass
@@ -83,6 +100,8 @@ class FhirFacts:
     employment_status: str = ""
     documents: list[str] = field(default_factory=list)
     other_injury_problems: int = 0  # injury-coded conditions NOT linked to this encounter
+    coverage_other_patient: list[str] = field(default_factory=list)  # dropped Coverage ids
+    encounter_returned_id: str = ""  # set if the server answered with a different Encounter id
     errors: dict[str, str] = field(default_factory=dict)  # resource label -> error message
 
     @property
@@ -92,7 +111,14 @@ class FhirFacts:
 
     @property
     def wc_coverages(self) -> list[CoverageFact]:
-        return [c for c in self.coverages if c.is_wc]
+        """WC coverages that count for this visit: active and in date. Encounter-level first."""
+        found = [c for c in self.coverages if c.is_wc and c.current_on(self.encounter_date)]
+        return sorted(found, key=lambda c: not c.encounter_level)
+
+    @property
+    def inactive_wc_coverages(self) -> list[CoverageFact]:
+        """WC coverages left out (cancelled, entered-in-error, an old claim's period...)."""
+        return [c for c in self.coverages if c.is_wc and not c.current_on(self.encounter_date)]
 
     @property
     def injury_conditions(self) -> list[ConditionFact]:
@@ -120,7 +146,7 @@ def is_wc_coverage_type(concept: dict | None) -> bool:
     return False
 
 
-def coverage_fact(res: dict) -> CoverageFact:
+def coverage_fact(res: dict, tz: tzinfo | None = None) -> CoverageFact:
     coding = ((res.get("type") or {}).get("coding") or [{}])[0]
     plan = next(
         (
@@ -145,6 +171,8 @@ def coverage_fact(res: dict) -> CoverageFact:
             e.get("url", "").endswith(COVERAGE_ENCOUNTER_URL_SUFFIX)
             for e in res.get("extension", [])
         ),
+        period_start=fhir_local_date(str((res.get("period") or {}).get("start", "")), tz),
+        period_end=fhir_local_date(str((res.get("period") or {}).get("end", "")), tz),
     )
 
 
@@ -169,9 +197,32 @@ def custom_attributes(encounter: dict) -> dict[str, str]:
 
 
 def _is_injury_code(coding: dict) -> bool:
-    """ICD-10-CM chapter 19 (S00-T88, injury/poisoning) or chapter 20 external causes (V-Y)."""
-    code = str(coding.get("code", "")).upper()
-    return coding.get("system") in ICD10_SYSTEMS and code[:1] in {"S", "T", "V", "W", "X", "Y"}
+    """ICD-10-CM injury codes that can point at a work injury: chapter 19 S00-T77/T79 (T51-T65
+    toxic exposures included) and external causes V00-Y38. Left out because they aren't
+    accidents: T78 (allergy / adverse effects), T80-T88 (complications of care), Y39-Y99
+    (misadventure during care, supplementary factors)."""
+    if coding.get("system") not in ICD10_SYSTEMS:
+        return False
+    code = str(coding.get("code", "")).upper().replace(".", "")
+    letter, digits = code[:1], code[1:3]
+    if not digits.isdigit():
+        return False
+    n = int(digits)
+    if letter == "S":
+        return True
+    if letter == "T":
+        return n <= 77 or n == 79
+    if letter in {"V", "W", "X"}:
+        return True
+    if letter == "Y":
+        return n <= 38
+    return False
+
+
+def _refers_to(ref: str, rtype: str, rid: str) -> bool:
+    """'Patient/1', 'https://server/r4/Patient/1' and 'Patient/1/_history/2' all mean Patient/1."""
+    parts = ref.split("/_history/")[0].rstrip("/").split("/")
+    return len(parts) >= 2 and parts[-2] == rtype and parts[-1] == rid
 
 
 def condition_fact(
@@ -284,8 +335,18 @@ def gather(
 
     diagnosis_ids: set[str] = set()
     if encounter:
+        subject = (encounter.get("subject") or {}).get("reference", "")
+        if subject and not _refers_to(subject, "Patient", patient_id):
+            raise ContextMismatch(
+                f"Encounter/{encounter.get('id') or encounter_id} belongs to {subject}, "
+                f"not Patient/{patient_id}"
+            )
         facts.encounter_read = True
-        facts.encounter_id = encounter.get("id", "") or facts.encounter_id
+        returned = encounter.get("id", "")
+        if encounter_id and returned and returned != encounter_id:
+            facts.encounter_returned_id = returned  # keep the requested id: same case key
+        else:
+            facts.encounter_id = returned or facts.encounter_id
         cls = (encounter.get("class") or {}).get("display") or (encounter.get("class") or {}).get(
             "code", ""
         )
@@ -312,9 +373,14 @@ def gather(
         queries.append(("Coverage (encounter)", {"-encounter": facts.encounter_id}))
     for label, params in queries:
         for res in _safe_search(source, "Coverage", params, label, facts.errors):
-            if res.get("id") not in seen:
-                seen.add(res.get("id"))
-                facts.coverages.append(coverage_fact(res))
+            if res.get("id") in seen:
+                continue
+            seen.add(res.get("id"))
+            beneficiary = (res.get("beneficiary") or {}).get("reference", "")
+            if beneficiary and not _refers_to(beneficiary, "Patient", patient_id):
+                facts.coverage_other_patient.append(res.get("id", "?"))
+                continue
+            facts.coverages.append(coverage_fact(res, tz))
 
     # Conditions: Oracle's open sandbox ignored `encounter` and returned the full problem list
     # (1,700+ items for the test patient), so we filter here and keep only conditions linked to

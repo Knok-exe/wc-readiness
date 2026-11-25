@@ -478,7 +478,9 @@ def test_low15_help_lists_all_default_wc_classes(capsys):
 
 def test_low16_mrn_match_with_different_demographics_is_flagged(demo_source, adt2):
     """fail_probe scenario G."""
-    adt = dataclasses.replace(adt2, patient_name="Other, Person", birth_date="1950-01-01")
+    # One of name / birth date differs: medium flag. (Both differ: a mismatch, see P1-3 in
+    # test_cipher_fixes.py.)
+    adt = dataclasses.replace(adt2, birth_date="1950-01-01")
     card = build_card(gather(demo_source, "demo-wc-1002", "demo-enc-1002"), adt)
     assert "ADT_DEMOGRAPHICS_DIFFER" in codes(card)
 
@@ -502,6 +504,7 @@ def test_low17_claim_status_attribute_is_not_a_claim_number(demo_data):
 
 def test_low19_update_error_returns_1_and_closes(tmp_path, capsys):
     db = str(tmp_path / "x.db")
+    Worklist(db).close()
     assert cli.main(["update", "5", "--status", "done", "--db", db]) == 1
     assert "no work item" in capsys.readouterr().err
 

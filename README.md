@@ -70,6 +70,18 @@ have nothing to show after it. Run a `card` first (or `wc-readiness demo --db de
 `demo` / `--demo`, `card` and `worklist`; `adt` always prints JSON. Dates are worked out in the
 site's time zone (`--site-tz`, default `America/New_York`).
 
+**Site settings stick.** `--wc-class` (your site's WC financial class values) and `--site-tz` are
+saved in the worklist DB the first time `card` runs against it, and later runs use the saved
+values even if you leave the flags off. Forgetting `--wc-class W` on a re-run can't turn a WC
+visit into "not WC". Passing a *different* value is refused (exit 1) unless you add
+`--reconfigure`, and the change is written to the audit log.
+
+**Safety checks.** If the Encounter you pass belongs to a different patient, `card` stops with
+exit 1 and writes nothing. Patient and encounter ids must be plain FHIR ids (letters, digits, `-`
+and `.`). `worklist`, `update` and `audit` only open an existing DB, so a mistyped `--db` is an
+error instead of an empty list. A new DB file is created readable by you only (it holds patient
+names).
+
 ---
 
 ## The basics (read this first)
@@ -157,19 +169,29 @@ nowhere in the EHR to keep "chase claim # for this visit". The app keeps its own
 - re-checking a visit **syncs** the list, with these rules:
   - a gap that was checked and is gone closes its open item as `resolved` (only the system sets
     `resolved`);
-  - a gap that **couldn't be checked** this time (a FHIR read failed, the ADT is for someone
-    else, or there was no `--adt` at all) leaves its item exactly as it was. A timeout or a
-    forgotten `--adt` never closes anything;
+  - a gap that **couldn't be checked** this time (a FHIR read failed or came back incomplete, the
+    ADT is for someone else, or there was no `--adt` at all) leaves its item exactly as it was. A
+    timeout or a forgotten `--adt` never closes anything;
+  - once a visit has been checked **with** a matching ADT, a later run without one can't change
+    the items that depend on ADT data (employer, injury date, claim #, carrier, job-related,
+    injury-date conflict, WC status unclear). The card still shows those gaps, marked
+    *provisional*, but the worklist doesn't open, reopen, flag or re-key anything for them (cases
+    in a DB from an older version count as having had an ADT). The rule behind this: the
+    worklist only acts on an input that was actually there this run;
   - the coordinator's decisions stick. A `dismissed` item stays dismissed while the gap is about
     the same data (each gap carries a *key*: the rule plus the values/sources it's about, not its
     wording, so a reworded message in a new version doesn't reopen anything). A `done` item whose
     gap is still there gets a **still_present** flag (and stays on the list) instead of quietly
-    reopening; setting it to `done` again clears the flag;
+    reopening. Setting it to `done` again means "I know": the flag is cleared and stays off until
+    the gap's data changes;
   - a closed item reopens only if something really changed: the gap's data changed, or the gap
     went away and came back. Databases from older versions are upgraded in place, and items
     already closed there adopt their current key without reopening;
   - a visit that is positively **not WC** closes open WC items and flags in-progress ones (see
-    "Is this even a WC visit?" below);
+    "Is this even a WC visit?" below). **If you see a `not_wc_visit` flag:** check the visit's
+    financial class with registration. If it really isn't WC, set the item to `done` or
+    `dismissed` (with a note). If it is WC, get registration to fix PV1-20 and re-run: the flag
+    clears itself. Setting it to `in_progress` again keeps working it and hides the flag;
   - nothing is duplicated, and severity/text changes on open items are recorded too;
 - every change goes into an **audit_log** table (who, what, when in UTC).
 
@@ -186,7 +208,7 @@ flowchart LR
     F --> M[card.build_card<br/>merge + gap rules]
     H --> M
     M --> T[render: readiness card]
-    M --> W[(worklist.py<br/>SQLite: cases, work_items, audit_log)]
+    M --> W[(worklist.py<br/>SQLite: cases, work_items, settings, audit_log)]
     W --> L[coordinator worklist]
 ```
 
@@ -239,7 +261,14 @@ it isn't marked, it's used but *unconfirmed*; with several unmarked IN1s, none i
 
 ADT comes first because registration is where these get typed, and most aren't in Oracle's FHIR at
 all. ADT fields are **only used if the message matches the FHIR patient** (by MRN, or name + birth
-date); otherwise the card raises `ADT_PATIENT_MISMATCH` instead of mixing two people's data.
+date); otherwise the card raises `ADT_PATIENT_MISMATCH` instead of mixing two people's data. A
+matching MRN with a different name **and** a different birth date counts as a mismatch too (an
+MRN typo or a collision). If PID-3 repeats, the repetition typed `MR` is used.
+
+**Which Coverage counts?** Only WC coverage that is `active` and whose period includes the visit
+date. Encounter-level coverage wins over patient-level. A cancelled one, or one from an old claim,
+is listed as `WC_COVERAGE_INACTIVE` (info) and ignored. Coverage whose beneficiary is a different
+patient is dropped (`COVERAGE_OTHER_PATIENT`, info).
 
 **Dates.** FHIR timestamps like `2026-11-21T02:15:00Z` are in UTC; that one is 9:15 PM on **Nov 20**
 in New York. The tool converts to the site's time zone before comparing dates, so it doesn't invent
@@ -258,9 +287,9 @@ a one-day conflict.
 | `ADT_DEMOGRAPHICS_DIFFER` | medium | MRN matches but name or birth date differ |
 | `JOB_RELATED_NOT_FLAGGED` | medium | ACC-5 blank |
 | `INJURY_DATE_CONFLICT` | medium | sources disagree on the (local) injury date |
-| `INJURY_DX_MISSING` | medium | no ICD-10-CM injury code (S, T, V-Y) linked to the encounter |
+| `INJURY_DX_MISSING` | medium | no ICD-10-CM injury code linked to the encounter (S, T00-T77/T79, V00-Y38; not T78 allergies, T80-T88 or Y39-Y99 care complications) |
 | `OCCUPATION_MISSING` | low | no occupation in social history |
-| `NOT_WC_VISIT`, `WC_STATUS_UNKNOWN`, `NO_ADT`, `ADT_WARNING`, `WORK_STATUS_NOTE_MISSING`, `FHIR_READ_FAILED:*` | info | context; not put on the worklist |
+| `NOT_WC_VISIT`, `WC_STATUS_UNKNOWN`, `NO_ADT`, `ADT_WARNING`, `WC_COVERAGE_INACTIVE`, `COVERAGE_OTHER_PATIENT`, `ENCOUNTER_ID_CHANGED`, `WORK_STATUS_NOTE_MISSING`, `FHIR_READ_FAILED:*` | info | context; not put on the worklist |
 
 **READY** = a WC visit with no high gaps and every FHIR read working. If a read failed (the sandbox
 sometimes times out), the card says **UNKNOWN**, because "couldn't check" is not the same as
@@ -345,16 +374,20 @@ worth asking IT about before going further than Phase 1.
   ADT feed (Phase 2) or a CCL extract. Here the A04 file is passed by hand.
 - **WC detection is heuristic.** Coverage type codes are reliable *if* the site maps WC plans to SOP
   95 (unverified). Financial class and plan type values are site-defined: pass `--wc-class` for
-  yours. Injury diagnosis = ICD-10-CM chapters 19/20 codes linked to the encounter (T78 allergies
-  count too).
+  yours (it's saved per worklist DB). Injury diagnosis = ICD-10-CM injury/external-cause codes
+  linked to the encounter, minus allergies (T78) and complications of care (T80-T88, Y39-Y99).
 - **Claim # in IN1-36** is a convention, not a standard. Some sites use IN1-49 or a custom attribute.
 - **Custom attributes are matched by name**, which is fragile; production should use attribute ids.
 - **Latest encounter** (when `--encounter` is omitted) is picked from the first 20 results only.
 - **The sandbox is shared and slow.** Its data changes; Condition searches return the patient's whole
   problem list (1,700+ items) and sometimes time out. The tool filters client-side and reports
   failed reads instead of crashing; failed reads never close worklist items.
-- **Not done yet:** HL7 table validation, A08/A03/A11 handling, PHI-safe logging, a lock file and
-  Dependabot, the coordinator UI (Phase 0 is CLI-only).
+- **Paging.** A search that needs more than 5 pages (or whose next link leaves the server) counts
+  as a failed read, so its rules are "couldn't check" rather than judged on partial data.
+- **PHI in the DB.** The worklist file holds names and gap text (employer, claim #, dates) in
+  plain SQLite. Fine for synthetic data; Phase 1 needs PHI out of messages and encryption at rest.
+- **Not done yet:** HL7 table validation, A08/A03/A11 handling, PHI-safe logging, a committed lock
+  file (Dependabot is set up), the coordinator UI (Phase 0 is CLI-only).
 
 ## Reuse of hl7v2-to-fhir
 

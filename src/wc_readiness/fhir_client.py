@@ -12,9 +12,11 @@ anyway, but this keeps the promise in code too.
 from __future__ import annotations
 
 import copy
+import re
 import time
 from collections.abc import Callable
 from typing import Protocol
+from urllib.parse import quote, urlsplit
 
 import requests
 
@@ -24,8 +26,30 @@ ORACLE_OPEN_SANDBOX = "https://fhir-open.cerner.com/r4/ec2458f2-1e24-41c8-b71b-0
 RETRY_STATUS = {429, 502, 503, 504}
 
 
+# The FHIR `id` datatype: letters, digits, '-' and '.', 1-64 characters. Anything else (a '/',
+# '?', '#', space...) could change which URL we request, so it's refused before any request.
+FHIR_ID = re.compile(r"^[A-Za-z0-9\-.]{1,64}$")
+
+
 class FhirError(Exception):
     """The server returned an error, an OperationOutcome, or could not be reached."""
+
+
+def check_id(resource_id: str) -> str:
+    """Return the id if it is a valid FHIR id, else raise ValueError."""
+    if not FHIR_ID.match(resource_id or "") or resource_id in (".", ".."):
+        raise ValueError(f"not a valid FHIR id: {resource_id!r} (letters, digits, '-', '.')")
+    return resource_id
+
+
+def same_server(url: str, base_url: str) -> bool:
+    """True if `url` is on the same scheme + host + port as `base_url` and under its path.
+    (A plain startswith() would accept https://fhir.example.com.attacker.net/...)"""
+    u, b = urlsplit(url), urlsplit(base_url)
+    if (u.scheme.lower(), u.netloc.lower()) != (b.scheme.lower(), b.netloc.lower()):
+        return False
+    base_path = b.path.rstrip("/")
+    return u.path == base_path or u.path.startswith(base_path + "/")
 
 
 class FhirSource(Protocol):
@@ -83,41 +107,66 @@ class FhirClient:
         try:
             body = resp.json()
         except ValueError:
-            body = {}
+            body = None  # not JSON at all (an HTML error page, a captive portal...)
+        if not isinstance(body, dict):
+            body = None
         if resp.status_code >= 400:
-            if body.get("resourceType") == "OperationOutcome":
+            if body is not None and body.get("resourceType") == "OperationOutcome":
                 raise FhirError(f"HTTP {resp.status_code}: {outcome_message(body)}")
             raise FhirError(f"HTTP {resp.status_code} from {url}")
+        if body is None or not body.get("resourceType"):
+            # A 200 that isn't a FHIR resource must not be read as "nothing found".
+            raise FhirError(f"HTTP {resp.status_code} from {url} was not a FHIR JSON resource")
         if body.get("resourceType") == "OperationOutcome":
             raise FhirError(outcome_message(body))
         return body
 
     def read(self, resource_type: str, resource_id: str) -> dict:
-        return self._get(f"{self.base_url}/{resource_type}/{resource_id}")
+        check_id(resource_id)
+        body = self._get(f"{self.base_url}/{resource_type}/{quote(resource_id, safe='')}")
+        if body.get("resourceType") != resource_type:
+            raise FhirError(
+                f"asked for {resource_type}/{resource_id}, got a {body.get('resourceType')}"
+            )
+        return body
 
     def search(self, resource_type: str, params: dict[str, str]) -> list[dict]:
         """Search and follow Bundle link[next] up to max_pages. Only resources of the requested
-        type are returned (servers may add OperationOutcome or included resources)."""
+        type are returned (servers may add OperationOutcome or included resources).
+
+        Partial results are never returned silently: if there are more pages than max_pages,
+        or a next link points at another server, this raises FhirError, so the rules that need
+        this search count as "couldn't check" instead of "checked, nothing there"."""
         url: str | None = f"{self.base_url}/{resource_type}"
         query: dict | None = dict(params)
         found: list[dict] = []
         for _ in range(self.max_pages):
-            if url is None:
-                break
             bundle = self._get(url, query)
+            if bundle.get("resourceType") != "Bundle":
+                raise FhirError(f"search {resource_type} returned a {bundle.get('resourceType')}")
             found.extend(
                 entry["resource"]
-                for entry in bundle.get("entry", [])
-                if (entry.get("resource") or {}).get("resourceType") == resource_type
+                for entry in bundle.get("entry", []) or []
+                if isinstance(entry, dict)
+                and (entry.get("resource") or {}).get("resourceType") == resource_type
             )
             url = next(
-                (lk["url"] for lk in bundle.get("link", []) if lk.get("relation") == "next"), None
+                (
+                    lk.get("url")
+                    for lk in bundle.get("link", []) or []
+                    if isinstance(lk, dict) and lk.get("relation") == "next"
+                ),
+                None,
             )
-            # Only follow next links that stay on the same server.
-            if url is not None and not url.startswith(self.base_url):
-                url = None
+            if url is None:
+                return found
+            if not same_server(url, self.base_url):
+                raise FhirError(f"search {resource_type}: next link leaves the server ({url})")
             query = None  # the next link already carries the query
-        return found
+        raise FhirError(
+            f"search {resource_type}: results truncated after {self.max_pages} pages "
+            f"({len(found)} so far)"
+        )
 
 
 def _refs(resource: dict) -> set[str]:
@@ -158,6 +207,7 @@ class FixtureSource:
         self.calls: list[tuple[str, str]] = []
 
     def read(self, resource_type: str, resource_id: str) -> dict:
+        check_id(resource_id)
         self.calls.append((resource_type, resource_id))
         for res in self.resources:
             if res.get("resourceType") == resource_type and res.get("id") == resource_id:

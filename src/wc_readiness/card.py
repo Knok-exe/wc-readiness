@@ -86,6 +86,20 @@ WC_RULE_CODES = (
     }
 )
 
+# Gaps whose answer depends on ADT data. Without a matched ADT they are computed from partial
+# data (e.g. a custom attribute instead of IN2-3, a key without ACC-1), so they are marked
+# provisional and the worklist doesn't let them change a case that has seen an ADT.
+ADT_DEPENDENT_CODES = (
+    {f"{p}_MISSING" for p in ESSENTIALS.values()}
+    | {f"{p}_UNCONFIRMED" for p in ESSENTIALS.values()}
+    | {
+        "INJURY_DATE_CONFLICT",
+        "WC_STATUS_UNCLEAR",
+        "JOB_RELATED_CONFLICT",
+        "JOB_RELATED_NOT_FLAGGED",
+    }
+)
+
 
 @dataclass
 class Gap:
@@ -97,6 +111,8 @@ class Gap:
     # this, not `message`, to decide whether a dismissed item's gap "really changed", so a
     # rewording in a later release doesn't reopen everything. "" = nothing beyond the code.
     key: str = ""
+    # Computed without a matched ADT although it depends on ADT data (see ADT_DEPENDENT_CODES).
+    provisional: bool = False
 
 
 @dataclass
@@ -112,6 +128,7 @@ class ReadinessCard:
     adt_matched: bool = True  # False also when the match couldn't be checked
     wc_status: str = "wc"  # wc | not_wc | unclear | unknown
     site_tz: str = ""
+    wc_classes: list[str] = field(default_factory=list)  # the PV1-20 values that meant WC
     gaps: list[Gap] = field(default_factory=list)
     unchecked: set[str] = field(default_factory=set)
 
@@ -182,6 +199,16 @@ def _patient_match(fhir: FhirFacts, adt: AdtWcData | None) -> tuple[str, bool, b
         return "could not check (FHIR Patient read failed)", False, False
     same_name = bool(adt.patient_name) and adt.patient_name.lower() == fhir.patient_name.lower()
     same_dob = bool(adt.birth_date) and adt.birth_date == fhir.birth_date
+    all_present = all((adt.patient_name, adt.birth_date, fhir.patient_name, fhir.birth_date))
+    if adt.mrn and adt.mrn in fhir.mrns and all_present and not same_name and not same_dob:
+        # Same MRN but a different name AND birth date: an MRN collision or typo, not this
+        # patient. Using its WC fields could close this patient's items.
+        return (
+            f"NOT MATCHED: MRN {adt.mrn} matches but name AND birth date differ (ADT "
+            f"{adt.patient_name} {adt.birth_date} vs FHIR {fhir.patient_name} {fhir.birth_date})",
+            False,
+            False,
+        )
     if adt.mrn and adt.mrn in fhir.mrns:
         differ = (bool(adt.patient_name) and not same_name) or (
             bool(adt.birth_date) and not same_dob
@@ -266,6 +293,7 @@ def build_card(
         patient_match=match_text,
         adt_matched=matched,
         site_tz=str(tz),
+        wc_classes=sorted(wc_financial_classes),
     )
     card.wc_status = _wc_status(card, strong=bool(signals), wc_classes=wc_financial_classes)
     if injury_dx:
@@ -305,8 +333,64 @@ def _wc_status(card: ReadinessCard, *, strong: bool, wc_classes) -> str:
 def find_gaps(
     card: ReadinessCard, *, fc_is_wc: bool, demographics_differ: bool, tz: tzinfo
 ) -> tuple[list[Gap], set[str]]:
+    gaps, unchecked = _find_gaps(
+        card, fc_is_wc=fc_is_wc, demographics_differ=demographics_differ, tz=tz
+    )
+    if not (card.adt is not None and card.adt_matched):
+        # No matched ADT: ADT-dependent results are provisional, and their absence proves
+        # nothing (so an earlier ADT-based item can't be resolved by this run).
+        for gap in gaps:
+            if gap.code in ADT_DEPENDENT_CODES:
+                gap.provisional = True
+        unchecked |= ADT_DEPENDENT_CODES - {g.code for g in gaps}
+    return gaps, unchecked
+
+
+def _context_gaps(fhir: FhirFacts) -> list[Gap]:
+    """Info notes about data that was left out on purpose."""
+    out = []
+    if fhir.coverage_other_patient:
+        out.append(
+            Gap(
+                "COVERAGE_OTHER_PATIENT",
+                "info",
+                "Ignored Coverage belonging to another patient: "
+                + ", ".join(fhir.coverage_other_patient),
+                "Check the encounter's coverage links in registration.",
+            )
+        )
+    if fhir.inactive_wc_coverages:
+        out.append(
+            Gap(
+                "WC_COVERAGE_INACTIVE",
+                "info",
+                "WC Coverage not counted (not active, or its period doesn't include this visit): "
+                + "; ".join(
+                    f"Coverage/{c.id} status={c.status or '?'} period "
+                    f"{c.period_start or '?'}..{c.period_end or '?'}"
+                    for c in fhir.inactive_wc_coverages
+                ),
+                "If this visit is part of that claim, registration must update the coverage.",
+            )
+        )
+    if fhir.encounter_returned_id:
+        out.append(
+            Gap(
+                "ENCOUNTER_ID_CHANGED",
+                "info",
+                f"Asked for Encounter/{fhir.encounter_id}, the server returned "
+                f"Encounter/{fhir.encounter_returned_id} (merged record?). The case stays filed "
+                "under the requested id.",
+            )
+        )
+    return out
+
+
+def _find_gaps(
+    card: ReadinessCard, *, fc_is_wc: bool, demographics_differ: bool, tz: tzinfo
+) -> tuple[list[Gap], set[str]]:
     fhir, adt, ess = card.fhir, card.adt, card.essentials
-    gaps: list[Gap] = []
+    gaps: list[Gap] = _context_gaps(fhir)
     unchecked: set[str] = set()
     add = gaps.append
     failed = set(fhir.errors)

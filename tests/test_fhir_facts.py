@@ -135,7 +135,7 @@ def test_injury_problems_from_other_visits_are_counted_not_used():
         "id": "old",
         "subject": p,
         "encounter": {"reference": "Encounter/other"},
-        "code": {"coding": [{"system": "http://hl7.org/fhir/sid/icd-10-cm", "code": "T78.40XA"}]},
+        "code": {"coding": [{"system": "http://hl7.org/fhir/sid/icd-10-cm", "code": "S93.401A"}]},
     }
     resources = [
         {"resourceType": "Patient", "id": "p"},

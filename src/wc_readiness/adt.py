@@ -126,7 +126,12 @@ def extract_wc(msg: Message) -> AdtWcData:
     if pid is None:
         data.warnings.append("no PID segment: cannot tell which patient this is")
     else:
-        data.mrn = pid.get(3)
+        # PID-3 can repeat (e.g. CMRN~MRN): use the repetition typed MR (PID-3.5), else the first.
+        reps = range(1, pid.count(3) + 1)
+        data.mrn = next(
+            (pid.get(3, rep=r) for r in reps if pid.get(3, rep=r, comp=5).upper() == "MR"),
+            pid.get(3),
+        )
         family, given = pid.get(5, comp=1), pid.get(5, comp=2)
         data.patient_name = ", ".join(p for p in (family, given) if p)
         data.birth_date = hl7_date(pid.get(7))

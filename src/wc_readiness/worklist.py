@@ -12,10 +12,13 @@ Re-running the card for the same encounter "syncs" the list. The rules:
   * a gap that was checked and is gone closes its open item as `resolved`;
   * a gap that could NOT be checked this run (a FHIR read failed, the ADT was for someone else)
     leaves its item exactly as it was: a timeout must never close anything;
+  * on a case that has seen a matched ADT, a run without one can't open, reopen, flag or
+    re-key the ADT-dependent items (their gaps are "provisional"): the worklist may only act on
+    an input that was actually present this run;
   * the coordinator's decisions stick: a `dismissed` item stays dismissed while the gap's data
     (Gap.key: the values and sources it is about, not its wording) is the same, and a `done`
     item whose gap is still there gets a "still present" flag instead of silently reopening
-    (setting it to done again clears the flag);
+    (setting it to done again acknowledges it: the flag stays off until the gap's data changes);
   * a closed item only reopens when something really changed: the gap's data changed since it
     was closed, or the gap went away and later came back;
   * a visit that is positively NOT workers' comp (matched ADT, non-WC financial class) closes
@@ -24,11 +27,17 @@ Re-running the card for the same encounter "syncs" the list. The rules:
   * changes to an open item's severity or text are audited too.
 Every change is written to audit_log (who, what, when), which a real deployment needs.
 
-Times are stored in UTC (ISO 8601). Only info-level gaps are left off the list.
+Site rule settings (WC financial classes, site time zone) are stored in the DB on first use,
+so a re-run that forgets --wc-class can't turn a WC visit into a non-WC one.
+
+Times are stored in UTC (ISO 8601). Only info-level gaps are left off the list. The DB holds
+patient names, so a new file is created readable by its owner only (0600).
 """
 
 from __future__ import annotations
 
+import json
+import os
 import sqlite3
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -69,6 +78,10 @@ CREATE TABLE IF NOT EXISTS work_items (
     updated_at  TEXT NOT NULL,
     UNIQUE (case_key, gap_code)
 );
+CREATE TABLE IF NOT EXISTS settings (
+    key         TEXT PRIMARY KEY,
+    value       TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS audit_log (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     item_id     INTEGER,
@@ -89,7 +102,18 @@ MIGRATIONS = {
     # item. NULL closed_key = closed before keys existed: adopt the current key, don't reopen.
     "gap_key": "TEXT",
     "closed_key": "TEXT",
+    # What the coordinator acknowledged by re-setting the status with a flag on it
+    # ("still_present:<gap key>" or "not_wc_visit"): that flag isn't raised again until it
+    # would be about something new.
+    "ack_key": "TEXT",
 }
+CASE_MIGRATIONS = {
+    "adt_seen": "INTEGER NOT NULL DEFAULT 0",  # has a matched ADT ever been merged for it?
+}
+
+
+class SettingsConflict(ValueError):
+    """An explicit --wc-class / --site-tz differs from what this worklist was set up with."""
 
 
 def utc_now() -> str:
@@ -113,17 +137,78 @@ class WorkItem:
     updated_at: str
 
 
+def _connect(path: str | Path, create: bool) -> sqlite3.Connection:
+    if str(path) == ":memory:":
+        return sqlite3.connect(":memory:")
+    target = Path(path)
+    if not create:
+        # Reading/updating an existing list: a mistyped --db must be an error, not a new,
+        # empty worklist that says "nothing to do".
+        return sqlite3.connect(f"{target.resolve().as_uri()}?mode=rw", uri=True)
+    if not target.exists():
+        os.close(os.open(target, os.O_CREAT | os.O_WRONLY, 0o600))  # owner-only: holds PHI
+    return sqlite3.connect(str(target))
+
+
 class Worklist:
-    def __init__(self, path: str | Path = ":memory:", clock=utc_now):
-        self.conn = sqlite3.connect(str(path))
-        self.conn.row_factory = sqlite3.Row
-        self.conn.executescript(SCHEMA)
-        have = {r["name"] for r in self.conn.execute("PRAGMA table_info(work_items)")}
-        for column, ddl in MIGRATIONS.items():
-            if column not in have:
-                self.conn.execute(f"ALTER TABLE work_items ADD COLUMN {column} {ddl}")
-        self.conn.commit()
+    def __init__(self, path: str | Path = ":memory:", clock=utc_now, *, create: bool = True):
+        self.conn = _connect(path, create)
+        try:
+            self.conn.row_factory = sqlite3.Row
+            self.conn.executescript(SCHEMA)
+            for table, migrations in (("work_items", MIGRATIONS), ("cases", CASE_MIGRATIONS)):
+                have = {r["name"] for r in self.conn.execute(f"PRAGMA table_info({table})")}
+                for column, ddl in migrations.items():
+                    if column not in have:
+                        self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+                        if column == "adt_seen":
+                            # Older DBs didn't record it. Assume yes, so the safe rule applies
+                            # (a run without ADT can't change ADT-dependent items).
+                            self.conn.execute("UPDATE cases SET adt_seen = 1")
+            self.conn.commit()
+        except sqlite3.Error:
+            self.conn.close()
+            raise
         self._now = clock
+
+    # ---- site settings ------------------------------------------------------------------------
+
+    def setting(self, key: str) -> str | None:
+        row = self.conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+        return None if row is None else row["value"]
+
+    def configure(
+        self,
+        values: dict[str, str],
+        explicit: set[str],
+        *,
+        reconfigure: bool = False,
+        actor: str = "system",
+    ) -> dict[str, str]:
+        """Return the effective site settings. The first run stores `values`; later runs use
+        what's stored. An explicit value that differs raises SettingsConflict unless
+        `reconfigure`, which changes it and audits the change. Not committed here: the next
+        sync commits it, so a run that fails before syncing leaves no trace."""
+        out = {}
+        for key, value in values.items():
+            stored = self.setting(key)
+            if stored is None or (reconfigure and key in explicit and value != stored):
+                self.conn.execute(
+                    "INSERT INTO settings VALUES (?, ?) ON CONFLICT(key) DO UPDATE "
+                    "SET value = excluded.value",
+                    (key, value),
+                )
+                detail = f"{key}: {stored!r} -> {value!r}" if stored else f"{key} = {value!r}"
+                self._audit(None, "settings", "settings", detail, actor)
+                out[key] = value
+            elif key in explicit and value != stored:
+                raise SettingsConflict(
+                    f"this worklist uses {key} {stored} (site setting); you passed {value}. "
+                    "Pass --reconfigure to change it."
+                )
+            else:
+                out[key] = stored
+        return out
 
     def close(self) -> None:
         self.conn.close()
@@ -145,6 +230,24 @@ class Worklist:
         sets = ", ".join(f"{k} = ?" for k in values)  # keys are fixed names from this module
         self.conn.execute(f"UPDATE work_items SET {sets} WHERE id = ?", (*values.values(), item_id))
 
+    def _check_settings(self, card: ReadinessCard) -> None:
+        """A card built with other site rules than this worklist's must not change it (a
+        forgotten --wc-class would otherwise turn WC visits into non-WC ones)."""
+        used = {"site_tz": card.site_tz}
+        if card.wc_classes:
+            used["wc_classes"] = json.dumps(sorted(card.wc_classes))
+        for key, value in used.items():
+            if not value:
+                continue
+            stored = self.setting(key)
+            if stored is None:
+                self.configure({key: value}, set())
+            elif stored != value:
+                raise SettingsConflict(
+                    f"this card was built with {key} {value}, but this worklist uses {stored} "
+                    "(site setting). Pass --reconfigure to change it."
+                )
+
     def sync(self, card: ReadinessCard, actor: str = "system") -> dict[str, int]:
         """Bring the work items for this card's case in line with its current gaps."""
         counts = dict.fromkeys(
@@ -157,15 +260,38 @@ class Worklist:
             return counts
         now = self._now()
         key = card.case_key
+        adt_now = card.adt is not None and card.adt_matched
         with self.conn:
+            self._check_settings(card)
+            seen = self.conn.execute(
+                "SELECT adt_seen FROM cases WHERE case_key = ?", (key,)
+            ).fetchone()
+            adt_seen = bool(seen and seen["adt_seen"])
             self.conn.execute(
-                "INSERT INTO cases VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(case_key) DO UPDATE "
+                "INSERT INTO cases (case_key, patient_id, encounter_id, patient_name, readiness,"
+                " first_seen, last_checked, adt_seen) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+                " ON CONFLICT(case_key) DO UPDATE "
                 "SET readiness = excluded.readiness, last_checked = excluded.last_checked, "
+                "adt_seen = MAX(cases.adt_seen, excluded.adt_seen), "
                 "patient_name = CASE WHEN excluded.patient_name = '' THEN cases.patient_name "
                 "ELSE excluded.patient_name END",
-                (key, card.patient_id, card.encounter_id, card.patient_name, card.status, now, now),
+                (
+                    key,
+                    card.patient_id,
+                    card.encounter_id,
+                    card.patient_name,
+                    card.status,
+                    now,
+                    now,
+                    int(adt_now),
+                ),
             )
-            current = {g.code: g for g in card.gaps if g.severity in WORKLIST_SEVERITIES}
+            gaps = [g for g in card.gaps if g.severity in WORKLIST_SEVERITIES]
+            # Provisional gaps were computed without the ADT. On a case that has had an ADT,
+            # they are "couldn't check": no open, reopen, flag or key change.
+            held = {g.code for g in gaps if g.provisional} if adt_seen else set()
+            counts["unchecked"] += len(held)
+            current = {g.code: g for g in gaps if g.code not in held}
             existing = {
                 row["gap_code"]: row
                 for row in self.conn.execute("SELECT * FROM work_items WHERE case_key = ?", (key,))
@@ -184,7 +310,7 @@ class Worklist:
                     continue
                 self._sync_present(row, gap, key, now, actor, counts)
             for code, row in existing.items():
-                if code in current:
+                if code in current or code in held:
                     continue
                 if code in card.unchecked:
                     counts["unchecked"] += 1  # couldn't check: leave it exactly as it is
@@ -215,7 +341,11 @@ class Worklist:
             self._set(row["id"], status="resolved", present=0, flag="", updated_at=now)
             self._audit(row["id"], key, "resolved", f"not a WC visit: {reason}", actor)
             counts["resolved"] += 1
-        elif row["status"] == "in_progress" and row["flag"] != NOT_WC_FLAG:
+        elif (
+            row["status"] == "in_progress"
+            and row["flag"] != NOT_WC_FLAG
+            and row["ack_key"] != NOT_WC_FLAG  # the owner already saw it and kept working
+        ):
             self._set(row["id"], flag=NOT_WC_FLAG, updated_at=now)
             self._audit(
                 row["id"], key, "flagged", f"left in progress, but not a WC visit: {reason}", actor
@@ -230,8 +360,8 @@ class Worklist:
         if row["gap_key"] != gap.key:
             self._set(row["id"], gap_key=gap.key)
         if status in ACTIVE:
-            if row["flag"] == NOT_WC_FLAG:  # it's a WC visit again
-                self._set(row["id"], flag="", updated_at=now)
+            if row["flag"] == NOT_WC_FLAG or row["ack_key"] == NOT_WC_FLAG:  # WC visit again
+                self._set(row["id"], flag="", ack_key=None, updated_at=now)
                 self._audit(row["id"], key, "unflagged", "WC visit again", actor)
             if changed:
                 self._set(
@@ -272,6 +402,7 @@ class Worklist:
                 present=1,
                 flag="",
                 closed_key=None,
+                ack_key=None,
                 updated_at=now,
             )
             detail = f"was {status}; {why}"
@@ -279,7 +410,11 @@ class Worklist:
                 detail += f"; {_diff(row, gap)}"
             self._audit(row["id"], key, "reopened", detail, actor)
             counts["reopened"] += 1
-        elif status == "done" and row["flag"] != STILL_PRESENT:
+        elif (
+            status == "done"
+            and row["flag"] != STILL_PRESENT
+            and row["ack_key"] != f"{STILL_PRESENT}:{gap.key}"  # acknowledged, same data
+        ):
             self._set(row["id"], flag=STILL_PRESENT, updated_at=now)
             self._audit(
                 row["id"], key, "flagged", "marked done but the gap is still present", actor
@@ -317,6 +452,14 @@ class Worklist:
             extra: dict = {"updated_at": self._now()}
             if "status" in changes or clear_flag:
                 extra["flag"] = ""
+                extra["ack_key"] = None
+            if clear_flag and "status" not in changes:
+                # Same status again = "I've seen the flag": remember what was acknowledged.
+                extra["ack_key"] = (
+                    f"{STILL_PRESENT}:{row['gap_key'] or ''}"
+                    if row["flag"] == STILL_PRESENT
+                    else row["flag"]
+                )
             if "status" in changes:
                 # Remember the gap's data when a person closes it, so a real change reopens it.
                 extra["closed_key"] = row["gap_key"] if status in CLOSED else None
