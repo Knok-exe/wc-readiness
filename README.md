@@ -166,8 +166,8 @@ spec. Example messages are in [`examples/messages/`](examples/messages/).
 `Coverage.type` says what kind of insurance a coverage is. Oracle codes it with the **Source of
 Payment Typology** (system `urn:oid:2.16.840.1.113883.3.221.5`). In that code list **95 = Worker's
 Compensation**, with children 951, 953, 954 and 959. The base FHIR value set has `WCBPOL` for the
-same idea. This tool treats any of those as "WC coverage". Pip saw no type-95 coverage in the
-sandbox, so whether your hospital's WC plans really come out as 95 is question #3 for IT.
+same idea. This tool treats any of those as "WC coverage". The open sandbox has no type-95
+coverage, so whether your hospital's WC plans really come out as 95 is a question for IT.
 
 ### Encounter custom attributes
 
@@ -180,7 +180,7 @@ one, this tool will find it by name ("Claim #"/"Claim Number", "Injury Date", "E
 
 ### The worklist (and why it's ours)
 
-Oracle's FHIR API has **no `Task` resource** (Pip checked both CapabilityStatements), so there is
+Oracle's FHIR API has **no `Task` resource** (neither of its CapabilityStatements lists one), so there is
 nowhere in the EHR to keep "chase claim # for this visit". The app keeps its own list in SQLite:
 
 - each blocking/medium/low **gap** becomes a **work item** (`open`);
@@ -407,7 +407,7 @@ built and owned by the hospital's own Cerner analysts, with **no external app, n
 registration and no SRs**. Pair it with making the WC fields *required* in the registration
 conversation and much of the problem may go away. The trade-offs: it needs CCL access and analyst
 time, it lives inside one hospital's build, and it doesn't give you a portable app or the audit
-trail this tool keeps. Pip marks this alternative as INFERRED (not verified at Knok's site), so it's
+trail this tool keeps. This alternative hasn't been verified at Knok's site yet, so it's
 worth asking IT about before going further than Phase 1.
 
 ## Limitations

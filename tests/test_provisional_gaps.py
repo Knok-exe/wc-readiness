@@ -1,7 +1,5 @@
-"""Regression tests for Cipher's re-test of 4185048 ('Re-test of 4185048' in
-CIPHER-CODE-REVIEW.md): NEW-1 (a no-ADT re-run must not call a NOT READY case READY), NEW-2
-(concurrent first runs must not overwrite each other's settings) and NEW-3 (next-link path
-tricks). Probes s01/s01b/s02/s03 are ported here."""
+"""Runs without an ADT: provisional gaps can't turn a NOT READY case READY; concurrent first
+runs don't overwrite each other's settings; next-link path tricks are refused."""
 
 import json
 import sqlite3
@@ -38,7 +36,7 @@ def offline(monkeypatch, demo_data):
 
 @pytest.fixture
 def no_employer_adt(tmp_path, complete_a04):
-    """s01: the complete A04 without IN2/GT1 (no employer) and without IN1-36 (claim number)."""
+    """The complete A04 without IN2/GT1 (no employer) and without IN1-36 (claim number)."""
     text = "\r".join(
         x
         for x in complete_a04.replace("\r", "\n").split("\n")
@@ -63,12 +61,10 @@ def item_id(db, code):
         return next(i.id for i in wl.items(include_closed=True) if i.gap_code == code)
 
 
-# ---- NEW-1 ---------------------------------------------------------------------------------------
+# ---- no-ADT re-runs keep the verdict -------------------------------------------------------------
 
 
-def test_new1_not_ready_case_stays_not_ready_without_adt(
-    offline, tmp_path, no_employer_adt, capsys
-):
+def test_not_ready_case_stays_not_ready_without_adt(offline, tmp_path, no_employer_adt, capsys):
     db = str(tmp_path / "w.db")
     base = ["card", "--patient", P1, "--encounter", E1, "--db", db]
     rc, out = run(capsys, *base, "--adt", str(no_employer_adt))
@@ -100,7 +96,7 @@ def test_new1_not_ready_case_stays_not_ready_without_adt(
     assert (tmp_path / "w.db").read_bytes() == before
 
 
-def test_new1_done_item_still_present_blocks_until_acknowledged(
+def test_done_item_still_present_blocks_until_acknowledged(
     offline, tmp_path, no_employer_adt, capsys
 ):
     db = str(tmp_path / "w.db")
@@ -132,9 +128,7 @@ def test_new1_done_item_still_present_blocks_until_acknowledged(
     assert run(capsys, *base, "--no-worklist")[0] == 0
 
 
-def test_new1_ready_case_without_adt_and_in_progress_item(
-    offline, tmp_path, no_employer_adt, capsys
-):
+def test_ready_case_without_adt_and_in_progress_item(offline, tmp_path, no_employer_adt, capsys):
     db = str(tmp_path / "w.db")
     base = ["card", "--patient", P1, "--encounter", E1, "--db", db]
     assert run(capsys, *base, "--adt", str(no_employer_adt))[0] == 2
@@ -145,7 +139,7 @@ def test_new1_ready_case_without_adt_and_in_progress_item(
     assert rc == 2 and "still open from the last ADT run: EMPLOYER_MISSING" in out
 
 
-def test_new1_no_worklist_without_a_db_counts_provisional_gaps(offline, tmp_path, capsys):
+def test_no_worklist_without_a_db_counts_provisional_gaps(offline, tmp_path, capsys):
     db = tmp_path / "none.db"
     rc, out = run(
         capsys, "card", "--patient", P1, "--encounter", E1, "--db", str(db), "--no-worklist"
@@ -156,7 +150,7 @@ def test_new1_no_worklist_without_a_db_counts_provisional_gaps(offline, tmp_path
     assert not db.exists()
 
 
-def test_new1_no_worklist_on_legacy_db_reads_without_migrating(
+def test_no_worklist_on_legacy_db_reads_without_migrating(
     offline, tmp_path, demo_data, complete_a04, capsys
 ):
     db = tmp_path / "old.db"
@@ -174,7 +168,7 @@ def test_new1_no_worklist_on_legacy_db_reads_without_migrating(
     assert db.read_bytes() == before
 
 
-def test_new1_read_only_worklist_never_writes(tmp_path, demo_data):
+def test_read_only_worklist_never_writes(tmp_path, demo_data):
     db = tmp_path / "w.db"
     Worklist(db).close()
     with Worklist(db, read_only=True) as wl:
@@ -184,10 +178,10 @@ def test_new1_read_only_worklist_never_writes(tmp_path, demo_data):
             wl.sync(card)
 
 
-# ---- NEW-2 ---------------------------------------------------------------------------------------
+# ---- concurrent first runs -----------------------------------------------------------------------
 
 
-def test_new2_concurrent_first_runs_dont_overwrite_settings(tmp_path):
+def test_concurrent_first_runs_dont_overwrite_settings(tmp_path):
     db = tmp_path / "race.db"
     a, b = Worklist(db), Worklist(db)
     a.configure({"wc_classes": '["W"]', "site_tz": "UTC"}, {"wc_classes", "site_tz"})
@@ -204,7 +198,7 @@ def test_new2_concurrent_first_runs_dont_overwrite_settings(tmp_path):
         assert details == ["wc_classes = '[\"W\"]'", "site_tz = 'UTC'"]
 
 
-def test_new2_concurrent_first_runs_with_same_settings_are_fine(tmp_path):
+def test_concurrent_first_runs_with_same_settings_are_fine(tmp_path):
     db = tmp_path / "same.db"
     a, b = Worklist(db), Worklist(db)
     for wl in (a, b):
@@ -225,7 +219,7 @@ def build_card_stub():
     return build_card(FhirFacts(patient_id="x"), None)
 
 
-# ---- NEW-3 ---------------------------------------------------------------------------------------
+# ---- next-link path tricks -----------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
@@ -244,5 +238,5 @@ def build_card_stub():
         ("https://:@fhir.example.com/r4/tenant/x", False),
     ],
 )
-def test_new3_next_link_path_tricks(url, ok):
+def test_next_link_path_tricks(url, ok):
     assert same_server(url, BASE) is ok

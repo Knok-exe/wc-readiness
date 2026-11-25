@@ -385,8 +385,8 @@ def gather(
             if len(parts) >= 2 and parts[-2] == "Condition":
                 diagnosis_ids.add(parts[-1])
 
-    # Coverage: patient-level plus encounter-level. Oracle refuses patient and -encounter in
-    # the same request (OBSERVED: "_id, patient, and -encounter may not be set at the same time").
+    # Coverage: patient-level plus encounter-level. Oracle refuses patient and -encounter in the
+    # same request ("_id, patient, and -encounter may not be set at the same time").
     seen: set[str] = set()
     queries = [("Coverage", {"patient": patient_id})]
     if facts.encounter_id:
