@@ -77,7 +77,13 @@ visit into "not WC". Passing a *different* value is refused (exit 1) unless you 
 `--reconfigure`, and the change is written to the audit log. Class values are compared without
 regard to case (`w` = `W`). A worklist DB made by an older version (it has cases but no saved
 settings) doesn't know which values it was checked with, so its first run needs `--wc-class` and
-`--site-tz` (or `--accept-defaults`); it won't quietly save the defaults.
+`--site-tz` (or `--accept-defaults`); it won't quietly save the defaults. If two first runs on a
+new DB start at the same moment with different values, the second one to finish is refused
+(exit 1, nothing written) instead of overwriting the first; just re-run it.
+
+**`--no-worklist`** writes nothing, but if the `--db` file exists it reads it (its saved settings
+and the case's history), so it gives the same verdict a normal run would. Without a DB file it
+can't know whether the visit ever had an ADT, so provisional gaps count, and it says so.
 
 **Safety checks.** If the Encounter you pass belongs to a different patient, or doesn't say which
 patient it belongs to, `card` stops with exit 1 and writes nothing. Patient and encounter ids must be plain FHIR ids (letters, digits, `-`
@@ -179,9 +185,12 @@ nowhere in the EHR to keep "chase claim # for this visit". The app keeps its own
     the items that depend on ADT data (employer, injury date, claim #, carrier, job-related,
     injury-date conflict, WC status unclear). The card still shows those gaps, marked
     *provisional*, but the worklist doesn't open, reopen, flag or re-key anything for them (cases
-    in a DB from an older version count as having had an ADT). They don't count for the card's
-    status either: a READY visit stays READY, and the status line says how many provisional
-    gaps were left out. (On a visit that has never had an ADT they count as usual.) The rule
+    in a DB from an older version count as having had an ADT). For the card's status, the
+    worklist items from the last ADT run stand in for them: if a high item for one of those gaps
+    is still `open`, `in_progress`, or `done` but flagged still present, the card is NOT READY
+    (exit 2) and names the item; otherwise a READY visit stays READY. Either way the status line
+    says how many provisional gaps weren't re-checked. (On a visit that has never had an ADT
+    they count as usual.) The rule
     behind this: the worklist only acts on an input that was actually there this run. One
     exception: if FHIR itself shows active WC coverage, a "WC status unclear" item can close;
   - the coordinator's decisions stick. A `dismissed` item stays dismissed while the gap is about
@@ -298,7 +307,8 @@ a one-day conflict.
 | `OCCUPATION_MISSING` | low | no occupation in social history |
 | `NOT_WC_VISIT`, `WC_STATUS_UNKNOWN`, `NO_ADT`, `ADT_WARNING`, `WC_COVERAGE_INACTIVE`, `COVERAGE_OTHER_PATIENT`, `ENCOUNTER_ID_CHANGED`, `WORK_STATUS_NOTE_MISSING`, `FHIR_READ_FAILED:*` | info | context; not put on the worklist |
 
-**READY** = a WC visit with no high gaps and every FHIR read working. If a read failed (the sandbox
+**READY** = a WC visit with no high gaps, no high worklist item still blocking from the last ADT
+run (see the provisional rule above), and every FHIR read working. If a read failed (the sandbox
 sometimes times out), the card says **UNKNOWN**, because "couldn't check" is not the same as
 "fine". If the Encounter can't be identified at all, nothing is written to the worklist.
 
@@ -390,7 +400,10 @@ worth asking IT about before going further than Phase 1.
   problem list (1,700+ items) and sometimes time out. The tool filters client-side and reports
   failed reads instead of crashing; failed reads never close worklist items.
 - **Paging.** A search that needs more than 5 pages (or whose next link leaves the server) counts
-  as a failed read, so its rules are "couldn't check" rather than judged on partial data.
+  as a failed read, so its rules are "couldn't check" rather than judged on partial data. A next
+  link must be on the same scheme, host and port, under the base path, with no userinfo (not even
+  an empty `@`), and no `.`/`..` segment in any disguise (`%2e%2e`, `..;/`, `..\`, `..%5c`); any
+  `%` left after decoding once is refused too.
 - **PHI in the DB.** The worklist file holds names and gap text (employer, claim #, dates) in
   plain SQLite. Fine for synthetic data; Phase 1 needs PHI out of messages and encryption at rest.
 - **Not done yet:** HL7 table validation, A08/A03/A11 handling, PHI-safe logging, a committed lock

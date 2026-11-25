@@ -118,12 +118,31 @@ def cmd_card(args) -> int:
     adt = read_adt(args.adt)
     source = FhirClient(args.server, timeout=args.timeout)
     if args.no_worklist:
-        apply_settings(args, None)
+        # Nothing is written. But if the worklist file exists, read it: its site settings and
+        # the case's ADT history decide the verdict exactly as a normal run would, so the same
+        # data never gives READY here and NOT READY there.
+        db = Path(args.db) if args.db != ":memory:" else None
+        wl = Worklist(db, read_only=True) if db is not None and db.is_file() else None
         try:
-            card = make_card(source, args.patient, args.encounter, adt, args)
-        except ContextMismatch as exc:
-            print(f"error: {exc}.", file=sys.stderr)
-            return 1
+            apply_settings(args, wl)
+            try:
+                card = make_card(source, args.patient, args.encounter, adt, args)
+            except ContextMismatch as exc:
+                print(f"error: {exc}.", file=sys.stderr)
+                return 1
+            if wl is not None:
+                wl.assess(card)
+        finally:
+            if wl is not None:
+                wl.close()
+        if args.format == "text":
+            if wl is not None:
+                print(f"Worklist {args.db}: read only (--no-worklist), not updated")
+            else:
+                print(
+                    f"No worklist at {args.db}: this case's ADT history is unknown, so "
+                    "provisional gaps count (--no-worklist)"
+                )
         emit([card], None, args.format)
     else:
         with Worklist(args.db) as wl:

@@ -132,6 +132,10 @@ class ReadinessCard:
     # Set by Worklist.sync when this case has had a matched ADT before: provisional gaps from
     # this ADT-less run then don't count for readiness (they couldn't change the worklist either).
     provisional_ignored: bool = False
+    # Set with provisional_ignored (by Worklist.assess): the case's high worklist items for the
+    # gaps this run couldn't re-check that are still open, in progress, or done but flagged as
+    # still present. They come from the last ADT run and still block readiness.
+    held_blocking: list[str] = field(default_factory=list)
     gaps: list[Gap] = field(default_factory=list)
     unchecked: set[str] = field(default_factory=set)
 
@@ -162,6 +166,7 @@ class ReadinessCard:
             self.wc_status == "wc"
             and not self.fhir.errors
             and not any(g.severity == "high" for g in self.counted_gaps)
+            and not self.held_blocking
         )
 
     @property
@@ -169,19 +174,28 @@ class ReadinessCard:
         text = self._status()
         if self.provisional_ignored and self.provisional_count:
             text += (
-                f" [{self.provisional_count} provisional ADT-based gap(s) not counted: no "
-                "matching ADT this run, so the last ADT run's results stand]"
+                f" [{self.provisional_count} provisional ADT-based gap(s) not re-checked: no "
+                "matching ADT this run, so the worklist items from the last ADT run stand]"
             )
         return text
 
     def _status(self) -> str:
         blocking = sum(1 for g in self.counted_gaps if g.severity == "high")
+        note = ""
         if blocking:
             provisional = sum(
                 1 for g in self.counted_gaps if g.severity == "high" and g.provisional
             )
             note = f", {provisional} provisional: no matched ADT" if provisional else ""
-            return f"NOT READY ({blocking} blocking gap(s){note})"
+        held = len(self.held_blocking)
+        if blocking or held:
+            parts = [f"{blocking} blocking gap(s){note}"] if blocking else []
+            if held:
+                parts.append(
+                    f"{held} blocking item(s) still open from the last ADT run: "
+                    f"{', '.join(self.held_blocking)}; no matched ADT this run"
+                )
+            return f"NOT READY ({'; '.join(parts)})"
         if self.wc_status == "not_wc":
             return "NOT A WC VISIT"
         if self.fhir.errors:

@@ -144,10 +144,12 @@ class WorkItem:
     updated_at: str
 
 
-def _connect(path: str | Path, create: bool) -> sqlite3.Connection:
+def _connect(path: str | Path, create: bool, read_only: bool = False) -> sqlite3.Connection:
     if str(path) == ":memory:":
         return sqlite3.connect(":memory:")
     target = Path(path)
+    if read_only:
+        return sqlite3.connect(f"{target.resolve().as_uri()}?mode=ro", uri=True)
     if not create:
         # Reading/updating an existing list: a mistyped --db must be an error, not a new,
         # empty worklist that says "nothing to do".
@@ -158,10 +160,24 @@ def _connect(path: str | Path, create: bool) -> sqlite3.Connection:
 
 
 class Worklist:
-    def __init__(self, path: str | Path = ":memory:", clock=utc_now, *, create: bool = True):
-        self.conn = _connect(path, create)
+    def __init__(
+        self,
+        path: str | Path = ":memory:",
+        clock=utc_now,
+        *,
+        create: bool = True,
+        read_only: bool = False,
+    ):
+        """`read_only` opens an existing file without creating, migrating or writing anything
+        (card --no-worklist uses it to read a case's ADT history); sync then refuses to run."""
+        self.read_only = read_only
+        self.conn = _connect(path, create, read_only)
+        self._now = clock
+        self._pending: dict[str, tuple[str, str | None, str]] = {}  # settings not yet saved
+        self.conn.row_factory = sqlite3.Row
+        if read_only:
+            return
         try:
-            self.conn.row_factory = sqlite3.Row
             self.conn.executescript(SCHEMA)
             for table, migrations in (("work_items", MIGRATIONS), ("cases", CASE_MIGRATIONS)):
                 have = {r["name"] for r in self.conn.execute(f"PRAGMA table_info({table})")}
@@ -176,8 +192,6 @@ class Worklist:
         except sqlite3.Error:
             self.conn.close()
             raise
-        self._now = clock
-        self._pending: dict[str, tuple[str, str | None, str]] = {}  # settings not yet saved
 
     # ---- site settings ------------------------------------------------------------------------
 
@@ -185,6 +199,8 @@ class Worklist:
         """The site setting in effect: one decided this run (not written yet), else stored."""
         if key in self._pending:
             return self._pending[key][0]
+        if "settings" not in self._tables():
+            return None  # a read-only, not yet migrated file
         row = self.conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
         return None if row is None else row["value"]
 
@@ -192,9 +208,22 @@ class Worklist:
         """A DB that already has cases but no saved settings: made before settings existed.
         Its cases may have been checked with a --wc-class we don't know, so defaults must not
         be saved into it silently."""
-        if self._pending or self.conn.execute("SELECT 1 FROM settings LIMIT 1").fetchone():
+        tables = self._tables()
+        if self._pending or (
+            "settings" in tables and self.conn.execute("SELECT 1 FROM settings LIMIT 1").fetchone()
+        ):
             return False
-        return self.conn.execute("SELECT 1 FROM cases LIMIT 1").fetchone() is not None
+        return "cases" in tables and (
+            self.conn.execute("SELECT 1 FROM cases LIMIT 1").fetchone() is not None
+        )
+
+    def _tables(self) -> set[str]:
+        return {
+            r[0] for r in self.conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        }
+
+    def _columns(self, table: str) -> set[str]:
+        return {r["name"] for r in self.conn.execute(f"PRAGMA table_info({table})")}
 
     def configure(
         self,
@@ -243,7 +272,22 @@ class Worklist:
         return out
 
     def _flush_settings(self) -> None:
-        for key, (value, stored, actor) in self._pending.items():
+        """Write the settings decided by configure(). Runs inside sync's write transaction, so
+        the re-read below can't race: if another run saved a different value since configure()
+        looked (e.g. two first runs on a new DB), this run's cards were built with stale
+        settings and must not be filed. Nothing is written then (the transaction rolls back)."""
+        pending, self._pending = self._pending, {}
+        for key, (value, stored, actor) in pending.items():
+            row = self.conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+            now = None if row is None else normalize_setting(key, row["value"])
+            if now == value:
+                continue  # another run already saved the same value: nothing to do
+            if now != stored:
+                raise SettingsConflict(
+                    f"another run changed the site setting {key} while this one was fetching "
+                    f"(this run expected {stored!r}, the worklist now has {now!r}). Nothing was "
+                    "written; re-run."
+                )
             self.conn.execute(
                 "INSERT INTO settings VALUES (?, ?) ON CONFLICT(key) DO UPDATE "
                 "SET value = excluded.value",
@@ -251,7 +295,6 @@ class Worklist:
             )
             detail = f"{key}: {stored!r} -> {value!r}" if stored else f"{key} = {value!r}"
             self._audit(None, "settings", "settings", detail, actor)
-        self._pending.clear()
 
     def close(self) -> None:
         self.conn.close()
@@ -305,24 +348,24 @@ class Worklist:
              "flagged", "unchecked", "skipped"),
             0,
         )  # fmt: skip
+        if self.read_only:
+            raise sqlite3.OperationalError("this worklist was opened read-only")
         if not card.has_case:
             counts["skipped"] = 1  # no encounter id: we'd file it under the wrong case
             with self.conn:
+                self._begin()
                 self._flush_settings()
             return counts
         now = self._now()
         key = card.case_key
         adt_now = card.adt is not None and card.adt_matched
         with self.conn:
+            self._begin()  # take the write lock first, so the reads below can't go stale
             self._check_settings(card)
             self._flush_settings()
-            seen = self.conn.execute(
-                "SELECT adt_seen FROM cases WHERE case_key = ?", (key,)
-            ).fetchone()
-            adt_seen = bool(seen and seen["adt_seen"])
-            # This case has had a matched ADT and this run has none: its provisional gaps don't
-            # count, for the worklist (below) or for the card's readiness.
-            card.provisional_ignored = adt_seen and not adt_now
+            # Decide readiness from the worklist state before this run changes it. Held and
+            # unchecked items (the only ones assess counts) are left exactly as they are below.
+            adt_seen = self.assess(card)
             self.conn.execute(
                 "INSERT INTO cases (case_key, patient_id, encounter_id, patient_name, readiness,"
                 " first_seen, last_checked, adt_seen) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
@@ -384,6 +427,44 @@ class Worklist:
                     self._set(row["id"], flag="", updated_at=now)
                     self._audit(row["id"], key, "confirmed", "gap now gone after done", actor)
         return counts
+
+    def _begin(self) -> None:
+        if not self.conn.in_transaction:
+            self.conn.execute("BEGIN IMMEDIATE")
+
+    def assess(self, card: ReadinessCard) -> bool:
+        """Fill in what the worklist knows about this card's case, without writing anything.
+        Returns whether the case has had a matched ADT before.
+
+        If it has and this run has none, the run's provisional (ADT-based) gaps can't be
+        re-checked: they don't count for readiness (card.provisional_ignored), and instead the
+        case's high items for those gaps that the last ADT run left open, in progress, or done
+        but still present (card.held_blocking) do. So the verdict is the same whether or not
+        the worklist is written (sync and card --no-worklist both call this)."""
+        card.provisional_ignored = False
+        card.held_blocking = []
+        tables = self._tables()
+        if not card.has_case or "cases" not in tables:
+            return False
+        cols = self._columns("cases")
+        row = self.conn.execute(
+            f"SELECT {'adt_seen' if 'adt_seen' in cols else '1'} AS adt_seen "
+            "FROM cases WHERE case_key = ?",
+            (card.case_key,),
+        ).fetchone()
+        adt_seen = bool(row and row["adt_seen"])  # older files: assume yes, as the migration does
+        if not adt_seen or (card.adt is not None and card.adt_matched):
+            return adt_seen
+        card.provisional_ignored = True
+        held = {g.code for g in card.gaps if g.provisional} | set(card.unchecked)
+        flag = "flag" if "flag" in self._columns("work_items") else "''"
+        rows = self.conn.execute(
+            f"SELECT gap_code FROM work_items WHERE case_key = ? AND severity = 'high' "
+            f"AND (status IN ('open', 'in_progress') OR {flag} = ?) ORDER BY gap_code",
+            (card.case_key, STILL_PRESENT),
+        )
+        card.held_blocking = [r["gap_code"] for r in rows if r["gap_code"] in held]
+        return adt_seen
 
     def _close_not_wc(self, row, card, key, now, actor, counts) -> None:
         """The visit is positively not WC (a matched ADT with a non-WC financial class).

@@ -280,7 +280,7 @@ def test_f8_ready_case_without_adt_stays_ready_and_says_why(
     capsys.readouterr()
     assert cli.main(base) == 0
     out = capsys.readouterr().out
-    assert "WC READINESS CARD   READY [2 provisional ADT-based gap(s) not counted" in out
+    assert "WC READINESS CARD   READY [2 provisional ADT-based gap(s) not re-checked" in out
     assert "EMPLOYER_MISSING (provisional: no matched ADT)" in out
     with Worklist(db) as wl:
         assert wl.items(include_closed=True) == []

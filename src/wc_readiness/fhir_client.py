@@ -57,18 +57,25 @@ def _origin(parts) -> tuple[str, str, int | None] | None:
 def same_server(url: str, base_url: str) -> bool:
     """True if `url` is on the same scheme + host + port as `base_url` (default ports filled in,
     so :443 is the same as no port) and under its path. A plain startswith() would accept
-    https://fhir.example.com.attacker.net/...; '.'/'..' segments (also %2e%2e) are refused
-    because the server would resolve them to a path outside the base."""
+    https://fhir.example.com.attacker.net/...; a server could also resolve '.'/'..' segments to
+    a path outside the base, so these are refused in every disguise we know of: encoded once
+    (%2e%2e), with ';' path parameters (..;/ on Java servers), split by a backslash (also
+    %5c, a separator on IIS), or encoded twice (any '%' left after one decode is refused: a
+    server's own next links never need it). Any userinfo, even an empty '@', is refused."""
     if "\\" in url:
         return False
     u, b = urlsplit(url), urlsplit(base_url)
-    if u.username or u.password:
+    if "@" in u.netloc or u.username or u.password:
         return False
     origin = _origin(u)
     if origin is None or not origin[1] or origin != _origin(b):
         return False
-    if any(seg in (".", "..") for seg in unquote(u.path).split("/")):
+    path = unquote(u.path)
+    if "%" in path:
         return False
+    for seg in re.split(r"[/\\]", path):
+        if seg.split(";", 1)[0] in (".", ".."):
+            return False
     base_path = b.path.rstrip("/")
     return u.path == base_path or u.path.startswith(base_path + "/")
 
