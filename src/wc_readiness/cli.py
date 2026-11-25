@@ -69,7 +69,9 @@ def apply_settings(args, wl: Worklist | None) -> None:
         "site_tz": args.site_tz or DEFAULT_SITE_TZ,
     }
     if wl is not None:
-        values = wl.configure(values, explicit, reconfigure=args.reconfigure)
+        values = wl.configure(
+            values, explicit, reconfigure=args.reconfigure, accept_defaults=args.accept_defaults
+        )
     args.wc_classes = frozenset(json.loads(values["wc_classes"]))
     args.tz = site_tz(values["site_tz"])
 
@@ -117,15 +119,20 @@ def cmd_card(args) -> int:
     source = FhirClient(args.server, timeout=args.timeout)
     if args.no_worklist:
         apply_settings(args, None)
-        card = make_card(source, args.patient, args.encounter, adt, args)
+        try:
+            card = make_card(source, args.patient, args.encounter, adt, args)
+        except ContextMismatch as exc:
+            print(f"error: {exc}.", file=sys.stderr)
+            return 1
         emit([card], None, args.format)
     else:
         with Worklist(args.db) as wl:
             apply_settings(args, wl)
+            # Settings are only decided here; they're written by sync, after the (slow) FHIR
+            # fetch, so the DB isn't write-locked while we wait on the network.
             try:
                 card = make_card(source, args.patient, args.encounter, adt, args)
             except ContextMismatch as exc:
-                wl.conn.rollback()  # not even the settings: nothing from this run is kept
                 print(f"error: {exc}. Nothing was written to the worklist.", file=sys.stderr)
                 return 1
             counts = wl.sync(card)
@@ -175,11 +182,17 @@ def cmd_audit(args) -> int:
         for row in wl.audit():
             print(
                 clean(
-                    f"{row['at']}  item {row['item_id']!s:>3}  {row['action']:<9} "
+                    f"{row['at']}  {_audit_subject(row):<8}  {row['action']:<9} "
                     f"{row['actor']:<12} {row['detail']}"
                 )
             )
     return 0
+
+
+def _audit_subject(row) -> str:
+    if row["item_id"] is not None:
+        return f"item {row['item_id']:>3}"
+    return row["case_key"] or "-"  # e.g. "settings"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -214,6 +227,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--reconfigure",
         action="store_true",
         help="allow --wc-class / --site-tz to change the values stored in this worklist (audited)",
+    )
+    rules.add_argument(
+        "--accept-defaults",
+        action="store_true",
+        help="for a worklist made before settings were saved: record the default --wc-class / "
+        "--site-tz values for it",
     )
     sub = p.add_subparsers(dest="command")
 

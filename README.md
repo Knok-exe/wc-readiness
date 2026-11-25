@@ -74,10 +74,13 @@ site's time zone (`--site-tz`, default `America/New_York`).
 saved in the worklist DB the first time `card` runs against it, and later runs use the saved
 values even if you leave the flags off. Forgetting `--wc-class W` on a re-run can't turn a WC
 visit into "not WC". Passing a *different* value is refused (exit 1) unless you add
-`--reconfigure`, and the change is written to the audit log.
+`--reconfigure`, and the change is written to the audit log. Class values are compared without
+regard to case (`w` = `W`). A worklist DB made by an older version (it has cases but no saved
+settings) doesn't know which values it was checked with, so its first run needs `--wc-class` and
+`--site-tz` (or `--accept-defaults`); it won't quietly save the defaults.
 
-**Safety checks.** If the Encounter you pass belongs to a different patient, `card` stops with
-exit 1 and writes nothing. Patient and encounter ids must be plain FHIR ids (letters, digits, `-`
+**Safety checks.** If the Encounter you pass belongs to a different patient, or doesn't say which
+patient it belongs to, `card` stops with exit 1 and writes nothing. Patient and encounter ids must be plain FHIR ids (letters, digits, `-`
 and `.`). `worklist`, `update` and `audit` only open an existing DB, so a mistyped `--db` is an
 error instead of an empty list. A new DB file is created readable by you only (it holds patient
 names).
@@ -176,8 +179,11 @@ nowhere in the EHR to keep "chase claim # for this visit". The app keeps its own
     the items that depend on ADT data (employer, injury date, claim #, carrier, job-related,
     injury-date conflict, WC status unclear). The card still shows those gaps, marked
     *provisional*, but the worklist doesn't open, reopen, flag or re-key anything for them (cases
-    in a DB from an older version count as having had an ADT). The rule behind this: the
-    worklist only acts on an input that was actually there this run;
+    in a DB from an older version count as having had an ADT). They don't count for the card's
+    status either: a READY visit stays READY, and the status line says how many provisional
+    gaps were left out. (On a visit that has never had an ADT they count as usual.) The rule
+    behind this: the worklist only acts on an input that was actually there this run. One
+    exception: if FHIR itself shows active WC coverage, a "WC status unclear" item can close;
   - the coordinator's decisions stick. A `dismissed` item stays dismissed while the gap is about
     the same data (each gap carries a *key*: the rule plus the values/sources it's about, not its
     wording, so a reworded message in a new version doesn't reopen anything). A `done` item whose
@@ -237,7 +243,8 @@ Coverage (type 95...), an IN1 whose plan is marked WC (IN1-2/IN1-15), or ACC-5 =
     working them and a registration slip (wrong financial class) shouldn't silently end that
     work; the flag clears by itself if a later run sees a WC visit again;
   - `done` and `dismissed` items are left exactly as they are.
-- an injury diagnosis or an ACC segment but no WC signal gives **WC STATUS UNCLEAR**
+- an injury diagnosis, an ACC segment or a Y99.0 code ("activity done for income or pay") but no
+  WC signal gives **WC STATUS UNCLEAR**
   (`WC_STATUS_UNCLEAR`, medium): someone should ask whether it happened at work.
 - **no ADT** (you left out `--adt`), or an ADT for a different patient, is *not* evidence of
   anything. The card says **UNKNOWN** (or WC STATUS UNCLEAR if FHIR shows an injury) and the

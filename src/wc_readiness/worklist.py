@@ -112,6 +112,13 @@ CASE_MIGRATIONS = {
 }
 
 
+def normalize_setting(key: str, value: str) -> str:
+    """WC classes are matched case-insensitively, so they're stored and compared upper-cased."""
+    if key == "wc_classes":
+        return json.dumps(sorted({c.strip().upper() for c in json.loads(value)}))
+    return value
+
+
 class SettingsConflict(ValueError):
     """An explicit --wc-class / --site-tz differs from what this worklist was set up with."""
 
@@ -170,12 +177,24 @@ class Worklist:
             self.conn.close()
             raise
         self._now = clock
+        self._pending: dict[str, tuple[str, str | None, str]] = {}  # settings not yet saved
 
     # ---- site settings ------------------------------------------------------------------------
 
     def setting(self, key: str) -> str | None:
+        """The site setting in effect: one decided this run (not written yet), else stored."""
+        if key in self._pending:
+            return self._pending[key][0]
         row = self.conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
         return None if row is None else row["value"]
+
+    def _is_legacy(self) -> bool:
+        """A DB that already has cases but no saved settings: made before settings existed.
+        Its cases may have been checked with a --wc-class we don't know, so defaults must not
+        be saved into it silently."""
+        if self._pending or self.conn.execute("SELECT 1 FROM settings LIMIT 1").fetchone():
+            return False
+        return self.conn.execute("SELECT 1 FROM cases LIMIT 1").fetchone() is not None
 
     def configure(
         self,
@@ -183,32 +202,56 @@ class Worklist:
         explicit: set[str],
         *,
         reconfigure: bool = False,
+        accept_defaults: bool = False,
         actor: str = "system",
     ) -> dict[str, str]:
-        """Return the effective site settings. The first run stores `values`; later runs use
-        what's stored. An explicit value that differs raises SettingsConflict unless
-        `reconfigure`, which changes it and audits the change. Not committed here: the next
-        sync commits it, so a run that fails before syncing leaves no trace."""
+        """Return the effective site settings. The first run on a new DB saves `values`; later
+        runs use what's saved. An explicit value that differs raises SettingsConflict unless
+        `reconfigure`, which changes it (audited). A DB that predates settings needs every
+        value passed explicitly once (or `accept_defaults` / `reconfigure`).
+
+        Nothing is written here, so no write lock is held while FHIR is fetched: the values are
+        saved by the next sync, inside its transaction (and dropped if the run fails before)."""
+        legacy = self._is_legacy()
         out = {}
         for key, value in values.items():
+            value = normalize_setting(key, value)
             stored = self.setting(key)
-            if stored is None or (reconfigure and key in explicit and value != stored):
-                self.conn.execute(
-                    "INSERT INTO settings VALUES (?, ?) ON CONFLICT(key) DO UPDATE "
-                    "SET value = excluded.value",
-                    (key, value),
-                )
-                detail = f"{key}: {stored!r} -> {value!r}" if stored else f"{key} = {value!r}"
-                self._audit(None, "settings", "settings", detail, actor)
+            stored = None if stored is None else normalize_setting(key, stored)
+            if stored is None:
+                if legacy and key not in explicit and not (accept_defaults or reconfigure):
+                    label = {"wc_classes": "WC classes (--wc-class)", "site_tz": "time zone"}
+                    raise SettingsConflict(
+                        "this worklist was created before site settings were saved, so it has "
+                        f"no record of the {label.get(key, key)} it was checked with. Pass "
+                        "--wc-class "
+                        "and --site-tz once to record them, or --accept-defaults if the defaults "
+                        "are right."
+                    )
+                self._pending[key] = (value, None, actor)
                 out[key] = value
-            elif key in explicit and value != stored:
-                raise SettingsConflict(
-                    f"this worklist uses {key} {stored} (site setting); you passed {value}. "
-                    "Pass --reconfigure to change it."
-                )
+            elif value != stored and key in explicit:
+                if not reconfigure:
+                    raise SettingsConflict(
+                        f"this worklist uses {key} {stored} (site setting); you passed {value}. "
+                        "Pass --reconfigure to change it."
+                    )
+                self._pending[key] = (value, stored, actor)
+                out[key] = value
             else:
                 out[key] = stored
         return out
+
+    def _flush_settings(self) -> None:
+        for key, (value, stored, actor) in self._pending.items():
+            self.conn.execute(
+                "INSERT INTO settings VALUES (?, ?) ON CONFLICT(key) DO UPDATE "
+                "SET value = excluded.value",
+                (key, value),
+            )
+            detail = f"{key}: {stored!r} -> {value!r}" if stored else f"{key} = {value!r}"
+            self._audit(None, "settings", "settings", detail, actor)
+        self._pending.clear()
 
     def close(self) -> None:
         self.conn.close()
@@ -240,8 +283,15 @@ class Worklist:
             if not value:
                 continue
             stored = self.setting(key)
+            stored = None if stored is None else normalize_setting(key, stored)
             if stored is None:
-                self.configure({key: value}, set())
+                if self._is_legacy():
+                    raise SettingsConflict(
+                        "this worklist was created before site settings were saved: record "
+                        "them first (CLI: --wc-class/--site-tz or --accept-defaults; code: "
+                        "Worklist.configure)"
+                    )
+                self.configure({key: value}, {key})
             elif stored != value:
                 raise SettingsConflict(
                     f"this card was built with {key} {value}, but this worklist uses {stored} "
@@ -257,16 +307,22 @@ class Worklist:
         )  # fmt: skip
         if not card.has_case:
             counts["skipped"] = 1  # no encounter id: we'd file it under the wrong case
+            with self.conn:
+                self._flush_settings()
             return counts
         now = self._now()
         key = card.case_key
         adt_now = card.adt is not None and card.adt_matched
         with self.conn:
             self._check_settings(card)
+            self._flush_settings()
             seen = self.conn.execute(
                 "SELECT adt_seen FROM cases WHERE case_key = ?", (key,)
             ).fetchone()
             adt_seen = bool(seen and seen["adt_seen"])
+            # This case has had a matched ADT and this run has none: its provisional gaps don't
+            # count, for the worklist (below) or for the card's readiness.
+            card.provisional_ignored = adt_seen and not adt_now
             self.conn.execute(
                 "INSERT INTO cases (case_key, patient_id, encounter_id, patient_name, readiness,"
                 " first_seen, last_checked, adt_seen) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"

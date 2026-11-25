@@ -16,7 +16,7 @@ import re
 import time
 from collections.abc import Callable
 from typing import Protocol
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote, unquote, urlsplit
 
 import requests
 
@@ -42,11 +42,32 @@ def check_id(resource_id: str) -> str:
     return resource_id
 
 
+_DEFAULT_PORTS = {"https": 443, "http": 80}
+
+
+def _origin(parts) -> tuple[str, str, int | None] | None:
+    scheme = parts.scheme.lower()
+    try:
+        port = parts.port
+    except ValueError:  # a port that isn't a number
+        return None
+    return scheme, (parts.hostname or "").lower(), port or _DEFAULT_PORTS.get(scheme)
+
+
 def same_server(url: str, base_url: str) -> bool:
-    """True if `url` is on the same scheme + host + port as `base_url` and under its path.
-    (A plain startswith() would accept https://fhir.example.com.attacker.net/...)"""
+    """True if `url` is on the same scheme + host + port as `base_url` (default ports filled in,
+    so :443 is the same as no port) and under its path. A plain startswith() would accept
+    https://fhir.example.com.attacker.net/...; '.'/'..' segments (also %2e%2e) are refused
+    because the server would resolve them to a path outside the base."""
+    if "\\" in url:
+        return False
     u, b = urlsplit(url), urlsplit(base_url)
-    if (u.scheme.lower(), u.netloc.lower()) != (b.scheme.lower(), b.netloc.lower()):
+    if u.username or u.password:
+        return False
+    origin = _origin(u)
+    if origin is None or not origin[1] or origin != _origin(b):
+        return False
+    if any(seg in (".", "..") for seg in unquote(u.path).split("/")):
         return False
     base_path = b.path.rstrip("/")
     return u.path == base_path or u.path.startswith(base_path + "/")

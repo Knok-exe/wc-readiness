@@ -61,7 +61,7 @@ def test_r1_probe3_rerun_without_adt_closes_nothing(demo_data, incomplete_a04):
     counts = wl.sync(rerun)
     assert counts["resolved"] == 0 and counts["unchecked"] == 6
     assert {i.status for i in wl.items(include_closed=True)} == {"open"}
-    assert [r["action"] for r in wl.audit() if r["item_id"]] == ["opened"] * 6
+    assert [r["action"] for r in wl.audit()] == ["settings"] * 2 + ["opened"] * 6
 
 
 def test_r1_mismatched_adt_is_not_evidence(demo_data, incomplete_a04, casey):

@@ -124,6 +124,19 @@ class FhirFacts:
     def injury_conditions(self) -> list[ConditionFact]:
         return [c for c in self.conditions if c.is_injury]
 
+    @property
+    def work_activity_conditions(self) -> list[ConditionFact]:
+        """Conditions coded Y99.0, "civilian activity done for income or pay": not an injury
+        diagnosis, but a (weak) sign the visit is about work."""
+        return [
+            c
+            for c in self.conditions
+            if any(
+                x.system in ICD10_SYSTEMS and x.code.upper().replace(".", "") == "Y990"
+                for x in c.codes
+            )
+        ]
+
 
 def concept_text(concept: dict | None) -> str:
     if not concept:
@@ -336,9 +349,11 @@ def gather(
     diagnosis_ids: set[str] = set()
     if encounter:
         subject = (encounter.get("subject") or {}).get("reference", "")
-        if subject and not _refers_to(subject, "Patient", patient_id):
+        if not _refers_to(subject, "Patient", patient_id):
+            # A missing subject fails closed too: we can't show it's this patient's visit.
             raise ContextMismatch(
-                f"Encounter/{encounter.get('id') or encounter_id} belongs to {subject}, "
+                f"Encounter/{encounter.get('id') or encounter_id} belongs to "
+                f"{subject or 'no patient (Encounter.subject is missing)'}, "
                 f"not Patient/{patient_id}"
             )
         facts.encounter_read = True

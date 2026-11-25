@@ -129,6 +129,9 @@ class ReadinessCard:
     wc_status: str = "wc"  # wc | not_wc | unclear | unknown
     site_tz: str = ""
     wc_classes: list[str] = field(default_factory=list)  # the PV1-20 values that meant WC
+    # Set by Worklist.sync when this case has had a matched ADT before: provisional gaps from
+    # this ADT-less run then don't count for readiness (they couldn't change the worklist either).
+    provisional_ignored: bool = False
     gaps: list[Gap] = field(default_factory=list)
     unchecked: set[str] = field(default_factory=set)
 
@@ -142,19 +145,43 @@ class ReadinessCard:
         return bool(self.patient_id and self.encounter_id)
 
     @property
+    def counted_gaps(self) -> list[Gap]:
+        """The gaps that decide readiness (provisional ones drop out when provisional_ignored)."""
+        if self.provisional_ignored:
+            return [g for g in self.gaps if not g.provisional]
+        return self.gaps
+
+    @property
+    def provisional_count(self) -> int:
+        return sum(1 for g in self.gaps if g.provisional and g.severity != "info")
+
+    @property
     def ready(self) -> bool:
         """A WC visit with no blocking gaps and every FHIR read working. Unknown is not fine."""
         return (
             self.wc_status == "wc"
             and not self.fhir.errors
-            and not any(g.severity == "high" for g in self.gaps)
+            and not any(g.severity == "high" for g in self.counted_gaps)
         )
 
     @property
     def status(self) -> str:
-        blocking = sum(1 for g in self.gaps if g.severity == "high")
+        text = self._status()
+        if self.provisional_ignored and self.provisional_count:
+            text += (
+                f" [{self.provisional_count} provisional ADT-based gap(s) not counted: no "
+                "matching ADT this run, so the last ADT run's results stand]"
+            )
+        return text
+
+    def _status(self) -> str:
+        blocking = sum(1 for g in self.counted_gaps if g.severity == "high")
         if blocking:
-            return f"NOT READY ({blocking} blocking gap(s))"
+            provisional = sum(
+                1 for g in self.counted_gaps if g.severity == "high" and g.provisional
+            )
+            note = f", {provisional} provisional: no matched ADT" if provisional else ""
+            return f"NOT READY ({blocking} blocking gap(s){note})"
         if self.wc_status == "not_wc":
             return "NOT A WC VISIT"
         if self.fhir.errors:
@@ -293,11 +320,13 @@ def build_card(
         patient_match=match_text,
         adt_matched=matched,
         site_tz=str(tz),
-        wc_classes=sorted(wc_financial_classes),
+        wc_classes=sorted({c.strip().upper() for c in wc_financial_classes}),
     )
     card.wc_status = _wc_status(card, strong=bool(signals), wc_classes=wc_financial_classes)
     if injury_dx:
         card.wc_signals.append(f"injury diagnosis ({injury_dx[0].text}) [weak]")
+    if fhir.work_activity_conditions:
+        card.wc_signals.append("Y99.0 activity done for income or pay [weak]")
     card.gaps, card.unchecked = find_gaps(
         card, fc_is_wc=fc_is_wc, demographics_differ=demographics_differ, tz=tz
     )
@@ -317,8 +346,10 @@ def _wc_status(card: ReadinessCard, *, strong: bool, wc_classes) -> str:
     if card.fhir.errors:
         return "unknown"
     adt = card.adt if card.adt_matched else None
-    weak = bool(card.fhir.injury_conditions) or (
-        adt is not None and bool(adt.injury_date_raw or adt.accident_code)
+    weak = (
+        bool(card.fhir.injury_conditions)
+        or bool(card.fhir.work_activity_conditions)
+        or (adt is not None and bool(adt.injury_date_raw or adt.accident_code))
     )
     fc = adt.financial_class.strip() if adt is not None else ""
     if adt is not None and fc and not is_wc_financial_class(fc, wc_classes):
@@ -342,7 +373,12 @@ def find_gaps(
         for gap in gaps:
             if gap.code in ADT_DEPENDENT_CODES:
                 gap.provisional = True
-        unchecked |= ADT_DEPENDENT_CODES - {g.code for g in gaps}
+        # Exception: on a visit FHIR shows to be WC (active WC coverage), "WC status unclear"
+        # was settled by positive evidence, so its item may close.
+        dependent = ADT_DEPENDENT_CODES
+        if card.wc_status == "wc":
+            dependent = dependent - {"WC_STATUS_UNCLEAR"}
+        unchecked |= dependent - {g.code for g in gaps}
     return gaps, unchecked
 
 
@@ -473,7 +509,8 @@ def _find_gaps(
             Gap(
                 "WC_STATUS_UNCLEAR",
                 "medium",
-                "There's an injury or accident but no WC financial class, WC coverage or "
+                "There's an injury, accident or work-activity code but no WC financial class, WC "
+                "coverage or "
                 "job-related flag. Is this a work injury?",
                 "Ask the patient whether the injury happened at work; update registration.",
                 key=f"fc={adt.financial_class.strip() if adt_usable else ''}",
