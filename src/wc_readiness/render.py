@@ -5,6 +5,7 @@ from __future__ import annotations
 import textwrap
 
 from .card import ReadinessCard
+from .dates import fhir_local_date, site_tz
 from .worklist import WorkItem
 
 LABELS = {
@@ -39,7 +40,7 @@ def render_card(card: ReadinessCard) -> str:
         + ")",
         f"Encounter  {card.encounter_id or 'none found'}"
         + (f"  {f.encounter_summary}" if f.encounter_summary else "")
-        + (f"  started {f.encounter_start[:10]}" if f.encounter_start else ""),
+        + (f"  started {f.encounter_date}" if f.encounter_date else ""),
         "ADT        "
         + (f"{adt.message_type} {adt.control_id}, {card.patient_match}" if adt else "none"),
     ]
@@ -77,7 +78,11 @@ def render_card(card: ReadinessCard) -> str:
     lines.append(f"  Occupation     {f.occupation or 'not recorded'}")
     lines.append(f"  Employment     {f.employment_status or 'not recorded'}")
     if f.custom_attributes:
-        attrs = "; ".join(f"{k} = {v}" for k, v in f.custom_attributes.items())
+        tz = site_tz(card.site_tz) if card.site_tz else site_tz()
+        attrs = "; ".join(
+            f"{k} = {v}" + (f" ({fhir_local_date(v, tz)} local)" if "T" in v[10:11] else "")
+            for k, v in f.custom_attributes.items()
+        )
         lines += _wrap(f"Custom attrs   {attrs}", "  ")
     lines.append(f"  Documents      {len(f.documents)} on this encounter")
 
@@ -104,11 +109,12 @@ def render_card(card: ReadinessCard) -> str:
 def render_worklist(items: list[WorkItem]) -> str:
     if not items:
         return "Worklist: nothing to do."
-    header = f"{'ID':>3}  {'Status':<11} {'Sev':<6} {'Patient':<20} {'Item':<26} Owner"
+    header = f"{'ID':>3}  {'Status':<11} {'Sev':<6} {'Patient':<20} {'Item':<26} "
+    header += f"{'Owner':<12} Flag"
     lines = ["Coordinator worklist", header, "-" * len(header)]
     lines.extend(
         f"{it.id:>3}  {it.status:<11} {it.severity:<6} {it.patient_name[:20]:<20} "
-        f"{it.gap_code[:26]:<26} {it.owner or '-'}"
+        f"{it.gap_code[:26]:<26} {(it.owner or '-')[:12]:<12} {it.flag}".rstrip()
         for it in items
     )
     return "\n".join(lines)

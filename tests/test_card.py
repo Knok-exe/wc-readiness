@@ -32,9 +32,10 @@ def test_incomplete_case_gaps(demo_source, incomplete_a04):
         "EMPLOYER_MISSING",
         "CLAIM_NUMBER_MISSING",
         "JOB_RELATED_NOT_FLAGGED",
-        "INJURY_DATE_CONFLICT",
         "OCCUPATION_MISSING",
     } <= codes(card)
+    # The custom attribute is 02:15Z on Nov 21 = Nov 20 local, same as ACC-1: no conflict.
+    assert "INJURY_DATE_CONFLICT" not in codes(card)
     wc_gap = next(g for g in card.gaps if g.code == "WC_COVERAGE_MISSING")
     assert "PV1-20=WC" in wc_gap.message
     assert [g.severity for g in card.gaps] == sorted(

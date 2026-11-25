@@ -373,7 +373,7 @@
       },
       {
        "url": "custom-attribute-value",
-       "valueDateTime": "2026-11-21T00:00:00Z"
+       "valueDateTime": "2026-11-21T02:15:00Z"
       }
      ]
     }
@@ -495,7 +495,7 @@
    "encounter": {
     "reference": "Encounter/demo-enc-1002"
    },
-   "onsetDateTime": "2026-11-20T00:00:00Z"
+   "onsetDateTime": "2026-11-20"
   },
   {
    "resourceType": "Observation",

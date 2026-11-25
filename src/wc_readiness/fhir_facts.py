@@ -8,7 +8,9 @@ Missing data and unreadable data are different things, and the card says which i
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import tzinfo
 
+from .dates import fhir_local_date
 from .fhir_client import FhirError, FhirSource
 
 # Source of Payment Typology (PHDSC/NAHDO). 95 = Worker's Compensation; 951/953/954/959 are
@@ -69,8 +71,10 @@ class FhirFacts:
     birth_date: str = ""
     mrns: list[str] = field(default_factory=list)
     encounter_id: str = ""
+    encounter_read: bool = False  # False: the Encounter itself could not be read
     encounter_summary: str = ""
     encounter_start: str = ""
+    encounter_date: str = ""  # local (site time zone) date of encounter_start
     encounter_identifiers: list[str] = field(default_factory=list)
     custom_attributes: dict[str, str] = field(default_factory=dict)
     coverages: list[CoverageFact] = field(default_factory=list)
@@ -80,6 +84,11 @@ class FhirFacts:
     documents: list[str] = field(default_factory=list)
     other_injury_problems: int = 0  # injury-coded conditions NOT linked to this encounter
     errors: dict[str, str] = field(default_factory=dict)  # resource label -> error message
+
+    @property
+    def coverage_unreadable(self) -> bool:
+        """True if any Coverage query failed (patient-level or encounter-level)."""
+        return any(label.startswith("Coverage") for label in self.errors)
 
     @property
     def wc_coverages(self) -> list[CoverageFact]:
@@ -165,7 +174,9 @@ def _is_injury_code(coding: dict) -> bool:
     return coding.get("system") in ICD10_SYSTEMS and code[:1] in {"S", "T", "V", "W", "X", "Y"}
 
 
-def condition_fact(res: dict, encounter_id: str, diagnosis_ids: set[str]) -> ConditionFact:
+def condition_fact(
+    res: dict, encounter_id: str, diagnosis_ids: set[str], tz: tzinfo | None = None
+) -> ConditionFact:
     codes = [
         CodeText(str(c.get("code", "")), c.get("system", ""), c.get("display", ""))
         for c in (res.get("code") or {}).get("coding", [])
@@ -183,7 +194,7 @@ def condition_fact(res: dict, encounter_id: str, diagnosis_ids: set[str]) -> Con
         id=res.get("id", ""),
         text=concept_text(res.get("code")),
         codes=codes,
-        onset=str(res.get("onsetDateTime", ""))[:10],
+        onset=fhir_local_date(str(res.get("onsetDateTime", "")), tz),
         category=categories,
         is_injury=any(_is_injury_code(c) for c in (res.get("code") or {}).get("coding", [])),
         linked_to_encounter=bool(encounter_id)
@@ -229,10 +240,19 @@ def _safe_search(
         return []
 
 
-def gather(source: FhirSource, patient_id: str, encounter_id: str | None = None) -> FhirFacts:
+def gather(
+    source: FhirSource,
+    patient_id: str,
+    encounter_id: str | None = None,
+    tz: tzinfo | None = None,
+) -> FhirFacts:
     """Collect everything the card needs for one patient (and one encounter) with read-only
-    GETs. Each request is independent: failures land in facts.errors."""
-    facts = FhirFacts(patient_id=patient_id)
+    GETs. Each request is independent: failures land in facts.errors. Dates are converted to the
+    site time zone `tz` (default America/New_York).
+
+    If an encounter id was asked for, it is kept even when reading that Encounter fails, so the
+    worklist still files the result under the right case."""
+    facts = FhirFacts(patient_id=patient_id, encounter_id=encounter_id or "")
 
     try:
         patient = source.read("Patient", patient_id)
@@ -264,7 +284,8 @@ def gather(source: FhirSource, patient_id: str, encounter_id: str | None = None)
 
     diagnosis_ids: set[str] = set()
     if encounter:
-        facts.encounter_id = encounter.get("id", "")
+        facts.encounter_read = True
+        facts.encounter_id = encounter.get("id", "") or facts.encounter_id
         cls = (encounter.get("class") or {}).get("display") or (encounter.get("class") or {}).get(
             "code", ""
         )
@@ -273,6 +294,7 @@ def gather(source: FhirSource, patient_id: str, encounter_id: str | None = None)
             p for p in (cls, etype, encounter.get("status", "")) if p
         )
         facts.encounter_start = (encounter.get("period") or {}).get("start", "")
+        facts.encounter_date = fhir_local_date(facts.encounter_start, tz)
         facts.encounter_identifiers = [
             i.get("value", "") for i in encounter.get("identifier", []) if i.get("value")
         ]
@@ -305,7 +327,7 @@ def gather(source: FhirSource, patient_id: str, encounter_id: str | None = None)
         for res in source.search("Condition", params):
             if _verification(res) in {"entered-in-error", "refuted"}:
                 continue
-            fact = condition_fact(res, facts.encounter_id, diagnosis_ids)
+            fact = condition_fact(res, facts.encounter_id, diagnosis_ids, tz)
             if fact.linked_to_encounter:
                 facts.conditions.append(fact)
             elif fact.is_injury:

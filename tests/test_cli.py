@@ -22,7 +22,7 @@ def test_demo_json(capsys):
     assert cli.main(["demo", "--format", "json"]) == 0
     data = json.loads(capsys.readouterr().out)
     assert [c["status"] for c in data["cards"]] == ["READY", "NOT READY (3 blocking gap(s))"]
-    assert len(data["worklist"]) == 6
+    assert len(data["worklist"]) == 5
 
 
 def test_no_args_prints_help(capsys):

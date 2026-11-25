@@ -33,7 +33,7 @@ def seg(name: str, fields: dict[int, str]) -> str:
 def msh(control_id: str, when: str) -> str:
     return (
         f"MSH|^~\\&|REGADT|EXAMPLEHOSP|WCREADY|EXAMPLEHOSP|{when}||ADT^A04^ADT_A01|"
-        f"{control_id}|P|2.5.1"
+        f"{control_id}|T|2.5.1"
     )
 
 
@@ -270,9 +270,9 @@ def build() -> None:
         control_id="WCLIVE0001",
         when="20261124090000",
         mrn="6000031",
-        name="SANDBOX^TESTPATIENT",
-        dob="",
-        sex="",
+        name="PATCHTEST^NANCY",
+        dob="19800102",
+        sex="F",
         fin="16137",
         financial_class="WC",
         carrier_id="SYNWC01",
@@ -363,8 +363,9 @@ def build() -> None:
                 custom_attr(
                     0, "ENCNTR:900001", "Complete Reg?", {"valueCodeableConcept": {"text": "No"}}
                 ),
+                # 02:15 UTC on Nov 21 is 9:15 PM on Nov 20 in New York: the same day as ACC-1.
                 custom_attr(
-                    1, "ENCNTR:900002", "Injury Date", {"valueDateTime": "2026-11-21T00:00:00Z"}
+                    1, "ENCNTR:900002", "Injury Date", {"valueDateTime": "2026-11-21T02:15:00Z"}
                 ),
             ],
             ["demo-dx-1002"],
@@ -383,7 +384,7 @@ def build() -> None:
             "demo-enc-1002",
             "S93.401A",
             "Sprain of unspecified ligament of right ankle, initial encounter",
-            "2026-11-20T00:00:00Z",
+            "2026-11-20",
         ),
         social(
             "demo-sh-1002-occ",

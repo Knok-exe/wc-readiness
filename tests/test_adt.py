@@ -36,18 +36,33 @@ def test_cr_line_endings_parse_the_same(complete_a04):
 
 
 @pytest.mark.parametrize(
-    "segments, value, source",
+    "segments, value, source, confirmed",
     [
-        (["GT1|1||Doe^Jo|" + "|" * 47 + "Acme Org"], "Acme Org", "GT1-51"),
-        (["GT1|1||Doe^Jo" + "|" * 13 + "Acme Person Employer"], "Acme Person Employer", "GT1-16"),
-        (["IN1|1|P|C|Carrier" + "|" * 7 + "Group Employer"], "Group Employer", "IN1-11"),
-        (["IN2|||Only Name Given"], "Only Name Given", "IN2-3"),
+        (["GT1|1||Doe^Jo|" + "|" * 47 + "Acme Org"], "Acme Org", "GT1-51 (guarantor)", False),
+        (
+            ["GT1|1||Doe^Jo" + "|" * 13 + "Acme Person Employer"],
+            "Acme Person Employer",
+            "GT1-16 (guarantor)",
+            False,
+        ),
+        (
+            ["IN1|1|P|C|Carrier" + "|" * 7 + "Group Employer"],
+            "Group Employer",
+            "IN1-11 (group employer)",
+            False,
+        ),
+        (
+            ["IN1|1|WC^Workers Comp|C|Carrier", "IN2|||Only Name Given"],
+            "Only Name Given",
+            "IN2-3",
+            True,
+        ),
     ],
 )
-def test_employer_fallback_order(segments, value, source):
+def test_employer_fallback_order(segments, value, source, confirmed):
     msg = "\r".join([MSH, "PID|1||123^^^H^MR||Doe^Jo", *segments])
     d = parse_adt(msg)
-    assert (d.employer.value, d.employer.source) == (value, source)
+    assert (d.employer.value, d.employer.source, d.employer.confirmed) == (value, source, confirmed)
 
 
 @pytest.mark.parametrize(

@@ -11,27 +11,64 @@ in SQLite.
 
 ## Quick start
 
-```bash
-uv venv && uv pip install -e ".[dev]"     # or: python -m venv .venv && pip install -e ".[dev]"
+You need Python 3.10 or newer. Pick **one** of the two ways below.
 
+**Option A: with [uv](https://docs.astral.sh/uv/) (no activation needed).** `uv run` runs a command
+inside the project's virtual environment for you, on Windows, macOS and Linux alike:
+
+```bash
+uv venv
+uv pip install -e ".[dev]"
+uv run wc-readiness --demo
+```
+
+**Option B: plain Python.** Make a virtual environment (a private folder of packages for this
+project), *activate* it so its commands are on your PATH, then install:
+
+```bash
+python -m venv .venv
+# activate it (once per terminal window), pick the line for your shell:
+source .venv/bin/activate          # macOS / Linux
+.venv\Scripts\Activate.ps1         # Windows PowerShell
+.venv\Scripts\activate.bat         # Windows Command Prompt (cmd)
+pip install -e ".[dev]"
+wc-readiness --demo
+```
+
+On Windows PowerShell, if activation says "running scripts is disabled", run
+`Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` once, or use the cmd line or Option A. Your
+prompt shows `(.venv)` while it's active. If you'd rather not activate, `.venv\Scripts\wc-readiness`
+(Windows) or `.venv/bin/wc-readiness` (macOS/Linux) works too. With Option A, put `uv run` in front
+of every command below.
+
+### Commands
+
+```bash
 wc-readiness --demo                       # offline: 2 invented patients, cards + worklist
 
-# live, against Oracle Health's open R4 sandbox (no account needed; can take 20-120 s)
-wc-readiness card --patient 12724066 --encounter 97954296 \
-    --adt examples/messages/a04_sandbox_12724066.hl7
+# live, against Oracle Health's open R4 sandbox (no account needed; can take 20-120 s).
+# This writes its worklist to wc_worklist.db in the current folder.
+wc-readiness card --patient 12724066 --encounter 97954296 --adt examples/messages/a04_sandbox_12724066.hl7
 
 wc-readiness adt examples/messages/a04_wc_incomplete.hl7   # what WC fields are in this message?
-wc-readiness worklist                                      # open items (from wc_worklist.db)
+wc-readiness worklist                                      # open items in wc_worklist.db
 wc-readiness update 1 --status in_progress --owner "Knok"  # work an item
+wc-readiness update 2 --status dismissed --note "not used at our site"   # dismissing needs a note
 wc-readiness audit                                         # who changed what, when
 
 pytest -q            # tests never touch the network
 ruff check . && ruff format --check .
-WC_LIVE=1 pytest -m live    # optional: one smoke test against the real sandbox
+WC_LIVE=1 pytest -m live    # optional: one smoke test against the real sandbox (PowerShell: $env:WC_LIVE=1; pytest -m live)
 ```
 
-`card` exits with code `0` when the card is READY and `2` when it isn't, so a script can tell.
-Add `--format json` to any card/worklist command for machine-readable output.
+The demo keeps its worklist **in memory**, so it leaves no files behind and `worklist`/`update`
+have nothing to show after it. Run a `card` first (or `wc-readiness demo --db demo.db`, then pass
+`--db demo.db` to `worklist`/`update`/`audit`).
+
+`card` exits with `0` when the card is READY, `3` when it's not a WC visit, `2` for anything else
+(not ready, unknown, unclear) and `1` on errors, so a script can tell. `--format json` works on
+`demo` / `--demo`, `card` and `worklist`; `adt` always prints JSON. Dates are worked out in the
+site's time zone (`--site-tz`, default `America/New_York`).
 
 ---
 
@@ -106,7 +143,8 @@ sandbox, so whether your hospital's WC plans really come out as 95 is question #
 
 Oracle exposes site-defined registration fields on `Encounter` as extensions called **custom
 attributes** (e.g. "Complete Reg?" in the sandbox). If a site captures the injury date or claim # in
-one, this tool will find it by name (`claim`, `injury date`, `employer`...).
+one, this tool will find it by name ("Claim #"/"Claim Number", "Injury Date", "Employer"...;
+"Claim Status" or "Employer Phone" don't count).
 
 ### The worklist (and why it's ours)
 
@@ -114,9 +152,19 @@ Oracle's FHIR API has **no `Task` resource** (Pip checked both CapabilityStateme
 nowhere in the EHR to keep "chase claim # for this visit". The app keeps its own list in SQLite:
 
 - each blocking/medium/low **gap** becomes a **work item** (`open`);
-- the coordinator moves it to `in_progress`, `done` or `dismissed`, with an owner and a note;
-- re-checking a visit **syncs** the list: fixed gaps close as `resolved`, gaps that come back are
-  reopened, nothing is duplicated;
+- the coordinator moves it to `in_progress`, `done` or `dismissed` (dismissing needs a note), with
+  an owner;
+- re-checking a visit **syncs** the list, with these rules:
+  - a gap that was checked and is gone closes its open item as `resolved` (only the system sets
+    `resolved`);
+  - a gap that **couldn't be checked** this time (a FHIR read failed, or the ADT is for someone
+    else) leaves its item exactly as it was. A timeout never closes anything;
+  - the coordinator's decisions stick. A `dismissed` item stays dismissed while the gap says the
+    same thing. A `done` item whose gap is still there gets a **still_present** flag (and stays on
+    the list) instead of quietly reopening;
+  - a closed item reopens only if something really changed: the gap's text changed, or the gap
+    went away and came back;
+  - nothing is duplicated, and severity/text changes on open items are recorded too;
 - every change goes into an **audit_log** table (who, what, when in UTC).
 
 ## How the pieces fit
@@ -148,20 +196,39 @@ flowchart LR
 | `src/wc_readiness/demo/` | invented, Oracle-shaped FHIR fixture + two synthetic A04s for `--demo` |
 | `scripts/make_demo_data.py` | regenerates the demo data and example messages |
 
+### Is this even a WC visit?
+
+The WC checks only run when there's a real WC signal: a WC financial class in PV1-20, a WC
+Coverage (type 95...), an IN1 whose plan is marked WC (IN1-2/IN1-15), or ACC-5 = Y. Otherwise:
+
+- no signal at all (or ACC-5 = N with nothing else) gives **NOT A WC VISIT** (`NOT_WC_VISIT`, info),
+  and any WC items already on the worklist for that visit are closed as resolved;
+- an injury diagnosis or an ACC segment but no WC signal gives **WC STATUS UNCLEAR**
+  (`WC_STATUS_UNCLEAR`, medium): someone should ask whether it happened at work.
+
 ### Where each essential value comes from
 
-The first source with a value wins, and the card prints the source next to the value:
+The first source with a value wins, and the card prints the source next to the value. Sources
+marked *unconfirmed* are shown but raise a medium `..._UNCONFIRMED` gap instead of counting as done:
 
 | Essential | 1st | 2nd | 3rd |
 |---|---|---|---|
-| Employer | ADT IN2-3 / GT1-51 / GT1-16 / IN1-11 | Encounter custom attribute | n/a |
-| Injury date | ADT ACC-1 | Encounter custom attribute | injury `Condition.onsetDateTime` |
-| Claim # | ADT IN1-36 | Encounter custom attribute | WC `Coverage` member id |
-| Carrier | ADT IN1-4 | WC `Coverage.payor` | n/a |
+| Employer | ADT IN2-3 under the WC IN1 | Encounter custom attribute | GT1-51 / GT1-16 / IN1-11 (*unconfirmed*: may be the guarantor's employer) |
+| Injury date | ADT ACC-1 | Encounter custom attribute | injury `Condition.onsetDateTime` (*unconfirmed*) |
+| Claim # | ADT IN1-36 of the WC IN1 | Encounter custom attribute | WC `Coverage` member id (*unconfirmed*: a member id isn't a claim #) |
+| Carrier | ADT IN1-4 of the WC IN1 | WC `Coverage.payor` | n/a |
+
+**Which IN1?** A message can carry several insurances (IN1 segments). The tool uses the one marked
+as WC by IN1-15 plan type or IN1-2 plan id (e.g. `WC`, "Workers Comp"). If there's only one IN1 and
+it isn't marked, it's used but *unconfirmed*; with several unmarked IN1s, none is used.
 
 ADT comes first because registration is where these get typed, and most aren't in Oracle's FHIR at
 all. ADT fields are **only used if the message matches the FHIR patient** (by MRN, or name + birth
 date); otherwise the card raises `ADT_PATIENT_MISMATCH` instead of mixing two people's data.
+
+**Dates.** FHIR timestamps like `2026-11-21T02:15:00Z` are in UTC; that one is 9:15 PM on **Nov 20**
+in New York. The tool converts to the site's time zone before comparing dates, so it doesn't invent
+a one-day conflict.
 
 ### The gap rules
 
@@ -170,14 +237,19 @@ date); otherwise the card raises `ADT_PATIENT_MISMATCH` instead of mixing two pe
 | `WC_COVERAGE_MISSING` | high | no Coverage typed 95/951/953/954/959/WCBPOL (says so if PV1-20 claims WC) |
 | `EMPLOYER_MISSING`, `INJURY_DATE_MISSING`, `CLAIM_NUMBER_MISSING`, `CARRIER_MISSING` | high | essential not found in any source |
 | `ADT_PATIENT_MISMATCH` | high | the ADT is for someone else; its fields were ignored |
-| `JOB_RELATED_NOT_FLAGGED` / `JOB_RELATED_CONFLICT` | medium | ACC-5 blank / ACC-5 = N on a WC visit |
-| `INJURY_DATE_CONFLICT` | medium | sources disagree on the injury date |
+| `JOB_RELATED_CONFLICT` | high | ACC-5 = N on a visit registered as WC |
+| `EMPLOYER_UNCONFIRMED`, `CLAIM_NUMBER_UNCONFIRMED`, `CARRIER_UNCONFIRMED`, `INJURY_DATE_UNCONFIRMED` | medium | found only in a source that may not be the WC value |
+| `WC_STATUS_UNCLEAR` | medium | injury/accident but no WC signal |
+| `ADT_DEMOGRAPHICS_DIFFER` | medium | MRN matches but name or birth date differ |
+| `JOB_RELATED_NOT_FLAGGED` | medium | ACC-5 blank |
+| `INJURY_DATE_CONFLICT` | medium | sources disagree on the (local) injury date |
 | `INJURY_DX_MISSING` | medium | no ICD-10-CM injury code (S, T, V-Y) linked to the encounter |
 | `OCCUPATION_MISSING` | low | no occupation in social history |
-| `NO_ADT`, `ADT_WARNING`, `WORK_STATUS_NOTE_MISSING`, `FHIR_READ_FAILED:*` | info | context; not put on the worklist |
+| `NOT_WC_VISIT`, `NO_ADT`, `ADT_WARNING`, `WORK_STATUS_NOTE_MISSING`, `FHIR_READ_FAILED:*` | info | context; not put on the worklist |
 
-**READY** = no high gaps and every FHIR read worked. If a read failed (the sandbox sometimes times
-out), the card says **UNKNOWN**, because "couldn't check" is not the same as "fine".
+**READY** = a WC visit with no high gaps and every FHIR read working. If a read failed (the sandbox
+sometimes times out), the card says **UNKNOWN**, because "couldn't check" is not the same as
+"fine". If the Encounter can't be identified at all, nothing is written to the worklist.
 
 ## Example output
 
@@ -190,8 +262,8 @@ WC READINESS CARD   NOT READY (3 blocking gap(s))
 Patient    Sampleperson, Casey  (FHIR Patient/demo-wc-1002, DOB 1995-02-03, MRN 700200)
 Encounter  demo-enc-1002  emergency / Emergency / in-progress  started 2026-11-21
 ADT        ADT^A04 WCDEMO0002, matched on MRN 700200
-WC signals PV1-20 financial class = WC; injury diagnosis (Sprain of unspecified ligament of
-   right ankle, initial encounter)
+WC signals PV1-20 financial class = WC; IN1 plan marked WC; injury diagnosis (Sprain of
+   unspecified ligament of right ankle, initial encounter) [weak]
 
 WC essentials
   Employer       MISSING
@@ -199,21 +271,27 @@ WC essentials
   Claim #        MISSING
   Carrier / TPA  Sample Casualty TPA   [IN1-4]
 ...
+  Custom attrs   Complete Reg? = No; Injury Date = 2026-11-21T02:15:00Z (2026-11-20 local)
+...
 Coordinator worklist
- ID  Status      Sev    Patient              Item                       Owner
------------------------------------------------------------------------------
+ ID  Status      Sev    Patient              Item                       Owner        Flag
+-----------------------------------------------------------------------------------------
   1  open        high   Sampleperson, Casey  CLAIM_NUMBER_MISSING       -
   2  open        high   Sampleperson, Casey  EMPLOYER_MISSING           -
   3  open        high   Sampleperson, Casey  WC_COVERAGE_MISSING        -
-  4  open        medium Sampleperson, Casey  INJURY_DATE_CONFLICT       -
-  5  open        medium Sampleperson, Casey  JOB_RELATED_NOT_FLAGGED    -
-  6  open        low    Sampleperson, Casey  OCCUPATION_MISSING         -
+  4  open        medium Sampleperson, Casey  JOB_RELATED_NOT_FLAGGED    -
+  5  open        low    Sampleperson, Casey  OCCUPATION_MISSING         -
 ```
 
+Notice the custom attribute's injury date: in UTC it's Nov 21, but in New York it's the evening of
+Nov 20, the same day as ACC-1, so there's no conflict.
+
 Live run against the sandbox (patient 12724066, encounter 97954296, merged with the synthetic
-`a04_sandbox_12724066.hl7`) on 2026-11-24 matched the ADT on MRN 6000031 and came back NOT READY:
-`WC_COVERAGE_MISSING` (the sandbox patient only has Medicare/Medicaid/private/public coverages),
-`INJURY_DX_MISSING` and `OCCUPATION_MISSING` (the sandbox's occupation is "Unknown").
+`a04_sandbox_12724066.hl7`) on 2026-11-24 matched the ADT on MRN 6000031 and came back NOT READY
+with `WC_COVERAGE_MISSING` (the sandbox patient only has Medicare/Medicaid/private/public
+coverages), `INJURY_DX_MISSING` (no diagnosis linked to that encounter) and `OCCUPATION_MISSING`
+(the sandbox's occupation observation holds "Unknown", so the card shows "not recorded";
+employment status is "Part time"). The sandbox's data is shared and changes, so your run may differ.
 
 ## Getting to go-live (CommunityWorks)
 
@@ -251,16 +329,17 @@ worth asking IT about before going further than Phase 1.
 - **One patient at a time.** Oracle FHIR has no "all WC visits" search; the real worklist needs an
   ADT feed (Phase 2) or a CCL extract. Here the A04 file is passed by hand.
 - **WC detection is heuristic.** Coverage type codes are reliable *if* the site maps WC plans to SOP
-  95 (unverified). Financial class values are site-defined: pass `--wc-class` for yours. Injury
-  diagnosis = ICD-10-CM chapters 19/20 codes linked to the encounter (T78 allergies count too).
+  95 (unverified). Financial class and plan type values are site-defined: pass `--wc-class` for
+  yours. Injury diagnosis = ICD-10-CM chapters 19/20 codes linked to the encounter (T78 allergies
+  count too).
 - **Claim # in IN1-36** is a convention, not a standard. Some sites use IN1-49 or a custom attribute.
 - **Custom attributes are matched by name**, which is fragile; production should use attribute ids.
 - **Latest encounter** (when `--encounter` is omitted) is picked from the first 20 results only.
 - **The sandbox is shared and slow.** Its data changes; Condition searches return the patient's whole
   problem list (1,700+ items) and sometimes time out. The tool filters client-side and reports
-  failed reads instead of crashing.
-- **Not done yet:** HL7 table validation, A08/A03/A11 handling, multiple IN1 repetitions, PHI-safe
-  logging, the coordinator UI (Phase 0 is CLI-only).
+  failed reads instead of crashing; failed reads never close worklist items.
+- **Not done yet:** HL7 table validation, A08/A03/A11 handling, PHI-safe logging, a lock file and
+  Dependabot, the coordinator UI (Phase 0 is CLI-only).
 
 ## Reuse of hl7v2-to-fhir
 
